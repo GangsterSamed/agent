@@ -50,7 +50,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	llmClient, err := llm.NewAnthropicWithLogger(log.With().Str("comp", "llm").Logger())
+	llmClient, err := llm.NewClientWithLogger(log.With().Str("comp", "llm").Logger())
 	if err != nil {
 		log.Fatal().Err(err).Msg("llm init")
 	}

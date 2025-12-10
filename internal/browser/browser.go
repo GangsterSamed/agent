@@ -29,11 +29,13 @@ type Controller interface {
 	ClickByTextFuzzy(ctx context.Context, text string) error
 	Fill(ctx context.Context, selector, text string) error
 	Read(ctx context.Context, selector string) (string, error)
-	Scroll(ctx context.Context, direction string, distance int) error
+	Scroll(ctx context.Context, direction string, distance int) (int, error)
 	ScrollToElement(ctx context.Context, selector string) error
 	WaitFor(ctx context.Context, selector string, timeout time.Duration) error
 	WaitForEmailElements(ctx context.Context, timeout time.Duration) error
+	WaitForStableDOM(ctx context.Context, timeout time.Duration) error
 	SaveState(ctx context.Context, path string) error
+	Hover(ctx context.Context, selector string) error // Hover over element (for Twitter-like sites where elements appear on hover)
 	Page() playwright.Page
 }
 
@@ -217,6 +219,19 @@ func (c *controller) ScrollToElement(ctx context.Context, selector string) error
 	return wrap(first.ScrollIntoViewIfNeeded())
 }
 
+// Hover hovers over element (useful for Twitter-like sites where elements appear only on hover)
+func (c *controller) Hover(ctx context.Context, selector string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	loc := c.page.Locator(selector)
+	first := loc.First()
+	if err := first.WaitFor(playwright.LocatorWaitForOptions{State: playwright.WaitForSelectorStateVisible}); err != nil {
+		return wrap(err)
+	}
+	return wrap(first.Hover())
+}
+
 // WaitForEmailElements waits for email-like elements to appear (non-trivial solution)
 func (c *controller) WaitForEmailElements(ctx context.Context, timeout time.Duration) error {
 	if err := ctx.Err(); err != nil {
@@ -269,6 +284,42 @@ func (c *controller) WaitForEmailElements(ctx context.Context, timeout time.Dura
 		}
 	}
 
+	// Fallback: search by text content for email indicators (ChatGPT recommendation)
+	// This helps when selectors don't match but email content is present
+	fallbackScript := `(limit) => {
+		const out = [];
+		function scan(root) {
+			const nodes = root.querySelectorAll("div, li, span, a, [role='option'], [role='listitem']");
+			for (const n of nodes) {
+				try {
+					const t = (n.innerText || n.textContent || "").trim();
+					if (t && (t.includes("@") || /тема|subject|от:|from:|письмо|email/i.test(t))) {
+						out.push(t.slice(0,200));
+						if (out.length >= limit) return;
+					}
+				} catch(e){}
+			}
+		}
+		scan(document);
+		const iframes = document.querySelectorAll("iframe");
+		for (const iframe of iframes) {
+			try {
+				const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+				if (doc) scan(doc);
+			} catch(e){}
+			if (out.length >= limit) break;
+		}
+		return out;
+	}`
+
+	val, err := c.page.Evaluate(fallbackScript, 3)
+	if err == nil {
+		if arr, ok := val.([]interface{}); ok && len(arr) > 0 {
+			// Found email-like content by text
+			return nil
+		}
+	}
+
 	return fmt.Errorf("no email elements found after %v", timeout)
 }
 
@@ -290,46 +341,180 @@ func (c *controller) Read(ctx context.Context, selector string) (string, error) 
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+
+	// Improved: try all frames (including iframes) for better iframe support
+	frames := c.page.Frames()
+
 	if strings.TrimSpace(selector) == "" {
+		// Try main frame first
 		val, err := c.page.InnerText("body")
-		if err != nil {
-			return "", wrap(err)
+		if err == nil && strings.TrimSpace(val) != "" {
+			return val, nil
 		}
-		return val, nil
+		// Try all frames
+		for _, frame := range frames {
+			if frame == c.page.MainFrame() {
+				continue
+			}
+			iframeVal, iframeErr := frame.InnerText("body")
+			if iframeErr == nil && strings.TrimSpace(iframeVal) != "" {
+				return iframeVal, nil
+			}
+		}
+		return val, nil // Return main frame result even if empty
 	}
+
+	// Try main frame first
 	loc := c.page.Locator(selector)
-	if err := loc.WaitFor(playwright.LocatorWaitForOptions{State: playwright.WaitForSelectorStateVisible}); err != nil {
-		return "", wrap(err)
+	if err := loc.WaitFor(playwright.LocatorWaitForOptions{
+		State:   playwright.WaitForSelectorStateVisible,
+		Timeout: playwright.Float(5000), // 5s timeout
+	}); err == nil {
+		val, err := loc.InnerText()
+		if err == nil && strings.TrimSpace(val) != "" {
+			return val, nil
+		}
 	}
-	val, err := loc.InnerText()
-	return val, wrap(err)
+
+	// Try all frames if main frame failed
+	for _, frame := range frames {
+		if frame == c.page.MainFrame() {
+			continue
+		}
+		iframeLoc := frame.Locator(selector)
+		if err := iframeLoc.WaitFor(playwright.LocatorWaitForOptions{
+			State:   playwright.WaitForSelectorStateVisible,
+			Timeout: playwright.Float(3000), // Shorter timeout for iframes
+		}); err == nil {
+			val, err := iframeLoc.InnerText()
+			if err == nil && strings.TrimSpace(val) != "" {
+				return val, nil
+			}
+		}
+	}
+
+	// Return error if nothing found
+	return "", fmt.Errorf("selector not found in any frame: %s", selector)
 }
 
-func (c *controller) Scroll(ctx context.Context, direction string, distance int) error {
+func (c *controller) Scroll(ctx context.Context, direction string, distance int) (int, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return 0, err
 	}
+
+	// Get viewport height for more accurate scrolling (like browser-use)
+	viewportHeight := defaultScrollAmount
+	viewportScript := `() => {
+		return Math.max(
+			window.innerHeight || 0,
+			document.documentElement.clientHeight || 0,
+			document.body.clientHeight || 0,
+			600 // Fallback
+		);
+	}`
+	if vh, err := c.page.Evaluate(viewportScript); err == nil {
+		if vhNum, ok := vh.(float64); ok && vhNum > 0 {
+			viewportHeight = int(vhNum)
+		}
+	}
+
+	// Use viewport height as default if distance is 0 or not provided
 	if distance == 0 {
-		distance = defaultScrollAmount
+		distance = viewportHeight
 	}
-	move := distance
-	switch strings.ToLower(direction) {
-	case "up", "north":
-		move = -distance
-	case "top":
-		_, err := c.page.Evaluate("window.scrollTo(0,0);")
-		return wrap(err)
-	case "bottom":
-		_, err := c.page.Evaluate("window.scrollTo(0, document.body.scrollHeight);")
-		return wrap(err)
-	case "page_down":
-		move = distance * 2
-	case "page_up":
-		move = -distance * 2
+
+	// Improved scroll: find scrollable container (ChatGPT recommendation)
+	// Prefer focused element's ancestor, then common containers
+	// This is critical for email clients and other SPAs that use internal scroll containers
+	script := `(dir, dist) => {
+		function isScrollable(el) {
+			if (!el) return false;
+			const s = window.getComputedStyle(el);
+			return (s.overflowY === 'auto' || s.overflowY === 'scroll' || s.overflow === 'auto' || s.overflow === 'scroll') 
+				   && el.scrollHeight > el.clientHeight;
+		}
+
+		const distance = Number(dist) || 600;
+		const candidates = [];
+
+		// Heuristic: prefer focused element's ancestor (ChatGPT recommendation)
+		const active = document.activeElement;
+		if (active) {
+			let p = active;
+			while (p) {
+				if (isScrollable(p)) { 
+					candidates.push(p); 
+					break; 
+				}
+				p = p.parentElement;
+			}
+		}
+
+		// Search for common scroll containers
+		const nodes = document.querySelectorAll('div,section,main,[role="main"],aside');
+		for (const n of nodes) {
+			if (isScrollable(n)) candidates.push(n);
+		}
+
+		// Also include document.scrollingElement
+		if (document.scrollingElement) candidates.push(document.scrollingElement);
+
+		// Remove duplicates
+		const seen = new Set();
+		const final = [];
+		for (const el of candidates) {
+			if (!el) continue;
+			const id = el.tagName + '|' + (el.id||'') + '|' + (el.className||'');
+			if (!seen.has(id)) { 
+				seen.add(id); 
+				final.push(el); 
+			}
+		}
+
+		// Fix: handle undefined/null direction (critical bug fix)
+		if (!dir || typeof dir !== 'string') {
+			dir = 'down'; // Default to down if direction is missing
+		}
+		const dirLower = dir.toLowerCase();
+		let move = distance;
+		if (dirLower === 'up' || dirLower === 'page_up' || dirLower === 'top') {
+			move = -distance;
+			if (dirLower === 'page_up') move *= 2;
+		} else if (dirLower === 'page_down') {
+			move = distance * 2;
+		} else if (dirLower === 'top') {
+			if (final.length > 0) {
+				final[0].scrollTop = 0;
+				return {scrolled: true, scrollTop: final[0].scrollTop};
+			}
+			window.scrollTo(0, 0);
+			return {scrolled: false};
+		} else if (dirLower === 'bottom') {
+			if (final.length > 0) {
+				final[0].scrollTop = final[0].scrollHeight;
+				return {scrolled: true, scrollTop: final[0].scrollTop};
+			}
+			window.scrollTo(0, document.body.scrollHeight);
+			return {scrolled: false};
+		}
+
+		// Try scrolling first candidate; if none, fallback to window.scrollBy
+		if (final.length > 0) {
+			final[0].scrollBy({top: move, left: 0, behavior: 'auto'});
+			return {scrolled: true, scrollTop: final[0].scrollTop};
+		}
+		
+		window.scrollBy(0, move);
+		return {scrolled: false, distance: distance};
+	}`
+
+	_, err := c.page.Evaluate(script, direction, distance)
+	if err != nil {
+		return 0, wrap(err)
 	}
-	script := fmt.Sprintf("window.scrollBy(0,%d);", move)
-	_, err := c.page.Evaluate(script)
-	return wrap(err)
+
+	// Return the actual distance used
+	return distance, nil
 }
 
 func (c *controller) WaitFor(ctx context.Context, selector string, timeout time.Duration) error {
@@ -344,6 +529,58 @@ func (c *controller) WaitFor(ctx context.Context, selector string, timeout time.
 		Timeout: playwright.Float(timeout.Seconds() * 1000),
 		State:   playwright.WaitForSelectorStateVisible,
 	}))
+}
+
+// WaitForStableDOM waits for DOM to stabilize (no mutations for a period)
+// This replaces fixed sleep() calls with event-driven waiting
+func (c *controller) WaitForStableDOM(ctx context.Context, timeout time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+
+	// Use Playwright's wait for load state + network idle
+	// This is more efficient than fixed sleep
+	if err := c.page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+		State:   playwright.LoadStateNetworkidle,
+		Timeout: playwright.Float(float64(timeout.Milliseconds())),
+	}); err != nil {
+		// If network idle fails, try DOMContentLoaded as fallback
+		_ = c.page.WaitForLoadState(playwright.PageWaitForLoadStateOptions{
+			State:   playwright.LoadStateDomcontentloaded,
+			Timeout: playwright.Float(1000),
+		})
+	}
+
+	// Additional: wait for no DOM mutations for 300ms (like MutationObserver)
+	script := `
+		() => {
+			return new Promise((resolve) => {
+				let timeoutId;
+				const observer = new MutationObserver(() => {
+					clearTimeout(timeoutId);
+					timeoutId = setTimeout(() => {
+						observer.disconnect();
+						resolve();
+					}, 300);
+				});
+				observer.observe(document.body, {
+					childList: true,
+					subtree: true,
+					attributes: true,
+					attributeOldValue: false
+				});
+				timeoutId = setTimeout(() => {
+					observer.disconnect();
+					resolve();
+				}, 300);
+			});
+		}
+	`
+	_, err := c.page.Evaluate(script)
+	return wrap(err)
 }
 
 func (c *controller) SaveState(ctx context.Context, path string) error {

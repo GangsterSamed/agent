@@ -14,11 +14,13 @@ import (
 
 // Element describes minimal info about interactive node.
 type Element struct {
-	Role string `json:"role"`
-	Text string `json:"text"`
-	Attr string `json:"attr"`
-	BBox string `json:"bbox"`
-	Sel  string `json:"selector"`
+	Index      int    `json:"index"` // Interactive index (1-based, like browser-use)
+	Role       string `json:"role"`
+	Text       string `json:"text"`
+	Attr       string `json:"attr"`
+	BBox       string `json:"bbox"`
+	Sel        string `json:"selector"`
+	ScrollInfo string `json:"scroll_info,omitempty"` // Scroll info like "0.0↑ 2.5↓ 0%" (from browser-use pattern)
 }
 
 // Summary is a compact view of current page.
@@ -52,7 +54,13 @@ func Collect(ctx context.Context, ctrl browser.Controller) (Summary, error) {
 	elems, _ := collectInteractive(ctx, page, 300)
 
 	// Snapshot Filtering Layer: filter and rank elements
-	filteredElems := filterAndRankElements(elems, 150) // Top 150 most relevant
+	// Limit to 50 most relevant elements for speed and token efficiency (chunking pattern)
+	filteredElems := filterAndRankElements(elems, 50) // Top 50 most relevant
+
+	// Assign interactive indices (1-based, like browser-use)
+	for i := range filteredElems {
+		filteredElems[i].Index = i + 1
+	}
 
 	return Summary{
 		URL:      url,
@@ -73,16 +81,61 @@ func (s Summary) String() string {
 
 func collectInteractive(ctx context.Context, page playwright.Page, limit int) ([]Element, error) {
 	script := `(limit) => {
+		// Helper to check if element is scrollable (from browser-use pattern)
+		function isScrollable(el) {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const overflowY = style.overflowY || style.overflow;
+			const overflowX = style.overflowX || style.overflow;
+			const allowsScroll = (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay' ||
+			                     overflowX === 'auto' || overflowX === 'scroll' || overflowX === 'overlay');
+			return allowsScroll && (el.scrollHeight > el.clientHeight || el.scrollWidth > el.clientWidth);
+		}
+		
+		// Helper to get scroll info text (from browser-use pattern)
+		function getScrollInfo(el) {
+			if (!isScrollable(el)) return "";
+			const scrollTop = el.scrollTop || 0;
+			const scrollHeight = el.scrollHeight || 0;
+			const clientHeight = el.clientHeight || 0;
+			if (scrollHeight <= clientHeight) return "";
+			
+			const contentAbove = Math.max(0, scrollTop);
+			const contentBelow = Math.max(0, scrollHeight - clientHeight - scrollTop);
+			const maxScrollTop = scrollHeight - clientHeight;
+			const vPct = maxScrollTop > 0 ? Math.round((scrollTop / maxScrollTop) * 100) : 0;
+			
+			const pagesAbove = (contentAbove / clientHeight).toFixed(1);
+			const pagesBelow = (contentBelow / clientHeight).toFixed(1);
+			
+			if (pagesAbove > 0 || pagesBelow > 0) {
+				return pagesAbove + "↑ " + pagesBelow + "↓ " + vPct + "%";
+			}
+			return "";
+		}
+		
 		// Helper to collect from shadow DOM
 		function collectFromShadow(root, pick, limit) {
 			if (!root || pick.length >= limit) return;
 			try {
-				// More aggressive selector: include email-specific patterns
-				const nodes = root.querySelectorAll("a,button,input,select,textarea,[role],[tabindex],[data-testid],[data-qa],[data-qa-type],[onclick],[data-uid],[data-subject],[data-sender]");
+				// More aggressive selector: include email-specific patterns AND scrollable containers
+				const nodes = root.querySelectorAll("a,button,input,select,textarea,[role],[tabindex],[data-testid],[data-qa],[data-qa-type],[onclick],[data-uid],[data-subject],[data-sender],div,section,main,article,aside");
 				for (const el of nodes) {
 					if (pick.length >= limit) break;
 					const rect = el.getBoundingClientRect();
 					if (rect.width === 0 && rect.height === 0) continue; // skip invisible
+					
+					// Check if element is scrollable (browser-use pattern)
+					const scrollInfo = getScrollInfo(el);
+					const isScrollableEl = scrollInfo !== "";
+					
+					// Skip non-interactive, non-scrollable elements
+					const hasRole = el.getAttribute("role");
+					const hasTabIndex = el.hasAttribute("tabindex");
+					const isInteractive = el.tagName === "A" || el.tagName === "BUTTON" || el.tagName === "INPUT" || 
+					                      el.tagName === "SELECT" || el.tagName === "TEXTAREA" || hasRole || hasTabIndex;
+					if (!isInteractive && !isScrollableEl) continue;
+					
 					const bbox = [Math.round(rect.x), Math.round(rect.y), Math.round(rect.width), Math.round(rect.height)].join(",");
 					const role = el.getAttribute("role") || el.tagName.toLowerCase();
 					const attrs = ["name","aria-label","placeholder","type","value","role","tabindex","data-testid","data-qa","data-qa-type","title"].map(a => (a + ":" + (el.getAttribute(a) || ""))).join("|");
@@ -94,7 +147,13 @@ func collectInteractive(ctx context.Context, page playwright.Page, limit int) ([
 					if (subject) text = (subject + " " + text).trim();
 					if (sender) text = (sender + " " + text).trim();
 					text = text.slice(0, 120); // increased from 80
-					if (!text && !attrs.trim()) continue;
+					
+					// For scrollable containers, add scroll info to text
+					if (isScrollableEl && !text) {
+						text = "scrollable container";
+					}
+					
+					if (!text && !attrs.trim() && !isScrollableEl) continue;
 					
 					// Build selector
 					let sel = "";
@@ -135,7 +194,7 @@ func collectInteractive(ctx context.Context, page playwright.Page, limit int) ([
 							if (idx > 0) sel = tag + ":nth-of-type(" + idx + ")";
 						}
 					}
-					pick.push({role, text, attr: attrs, bbox, selector: sel});
+					pick.push({role, text, attr: attrs, bbox, selector: sel, scrollInfo: scrollInfo});
 					
 					// Recurse into shadow DOM
 					if (el.shadowRoot) {
@@ -171,6 +230,7 @@ func collectInteractive(ctx context.Context, page playwright.Page, limit int) ([
 						try {
 							const rect = container.getBoundingClientRect();
 							if (rect.width > 0 && rect.height > 0) {
+								const scrollInfo = getScrollInfo(container);
 								const bbox = [Math.round(rect.x), Math.round(rect.y), Math.round(rect.width), Math.round(rect.height)].join(",");
 								const role = container.getAttribute("role") || container.tagName.toLowerCase();
 								const text = (container.innerText || container.textContent || "").trim().slice(0, 120);
@@ -181,8 +241,8 @@ func collectInteractive(ctx context.Context, page playwright.Page, limit int) ([
 								} else if (container.getAttribute("data-testid")) {
 									sel = "[data-testid=\"" + container.getAttribute("data-testid") + "\"]";
 								}
-								if (text || attrs) {
-									pick.push({role, text, attr: attrs, bbox, selector: sel});
+								if (text || attrs || scrollInfo !== "") {
+									pick.push({role, text, attr: attrs, bbox, selector: sel, scrollInfo: scrollInfo});
 								}
 							}
 						} catch (e) {
