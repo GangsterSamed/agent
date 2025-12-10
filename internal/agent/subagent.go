@@ -51,21 +51,35 @@ func (e *EmailAgent) CanHandle(task string) bool {
 const emailSystemPrompt = `You are a specialized email agent for browser automation.
 Your expertise: reading, searching, and managing emails in web mail clients (Gmail, Yandex Mail, Outlook, etc.).
 
+CHUNKING STRATEGY (CRITICAL):
+- Snapshot shows first 50 most relevant elements (fast, token-efficient).
+- ALWAYS check snapshot.elements FIRST.
+- If email list is NOT in snapshot (especially in iframes), use collect_texts("[data-testid*='message']") or read_page() to explore DOM.
+- This is critical for Yandex Mail which loads emails in iframes.
+- CRITICAL: Elements in snapshot have INDICES [1], [2], [3]... Use click_by_index with the index number (e.g., click_by_index with index=3).
+  This is the PREFERRED method - more reliable than selectors!
+- If emails are not in snapshot (iframe), use collect_texts which returns indices. Then use click_by_index with the index from collect_texts result.
+
 CRITICAL EMAIL-SPECIFIC RULES:
-1. Email lists are often in IFRAMES or shadow DOM - elements may not be immediately visible.
+1. Email lists are often in IFRAMES or shadow DOM - elements may not be immediately visible in snapshot.
 2. Look for email-specific patterns in snapshot.elements:
    - Elements with text containing email subjects, senders, dates
    - Elements with role="listitem", "article", "row", or similar
    - Elements with data attributes like data-subject, data-sender, data-id
    - Elements with selectors containing "mail", "message", "letter", "item"
-3. Email clients use virtual scrolling - you may need to scroll multiple times to load emails.
-4. After scrolling, wait 1-2 seconds for emails to load, then check snapshot again.
-5. To read an email: click on the email element (usually the subject or sender text).
-6. To delete emails: look for delete buttons/icons (trash, delete icon, or "удалить" text).
-7. For spam: look for "spam", "спам" text or spam-related buttons.
-8. Use click_role with name from element.text OR click_selector with element.selector.
-9. If no emails visible after 3-4 scrolls, try clicking on inbox/folder links first.
-10. Respond with SINGLE JSON: {"action":"...","input":{...}} or {"action":"finish","input":{"message":"..."}}`
+3. If snapshot doesn't show emails, use collect_texts("[data-testid*='message']") or read_page() to explore iframe content.
+4. Email clients use virtual scrolling - you may need to scroll multiple times to load emails.
+5. After scrolling, wait 1-2 seconds for emails to load, then check snapshot again.
+6. To read an email: click on the email element (usually the subject or sender text).
+7. To delete emails: look for delete buttons/icons (trash, delete icon, or "удалить" text).
+8. For spam: look for "spam", "спам" text or spam-related buttons.
+9. Use click_by_index with element.index (PREFERRED) OR click_role with name from element.text OR click_selector with element.selector (fallback).
+10. If no emails visible after 3-4 scrolls, try clicking on inbox/folder links first.
+11. TASK COMPLETION: When task is done (e.g., read 10 emails and deleted spam), use {"action":"finish","input":{"message":"Read 10 emails, deleted X spam emails"}}.
+12. DO NOT navigate to Spam folder if task is about reading emails from Inbox - stay in Inbox!
+13. DO NOT click on folder that is already active (e.g., don't click "Спам" if you're already in Spam folder).
+14. DO NOT repeat the same click_by_index action more than 2 times - if it doesn't work, try a different action!
+15. Respond with SINGLE JSON: {"action":"...","input":{...}} or {"action":"finish","input":{"message":"..."}}`
 
 func (e *EmailAgent) Next(ctx context.Context, state State) (Decision, error) {
 	// Handle empty snapshot on first step - just navigate
@@ -99,8 +113,19 @@ func (e *EmailAgent) Next(ctx context.Context, state State) (Decision, error) {
 	// Build payload safely - limit size to avoid API errors
 	pageMap := state.Summary.ToMap()
 	// Limit elements count in payload to avoid too large requests
-	if elems, ok := pageMap["elements"].([]snapshot.Element); ok && len(elems) > 50 {
-		pageMap["elements"] = elems[:50] // Only first 50 elements
+	if elems, ok := pageMap["elements"].([]snapshot.Element); ok {
+		if len(elems) > 50 {
+			pageMap["elements"] = elems[:50] // Only first 50 elements
+		}
+		// Add available indices info to help LLM
+		availableIndices := make([]int, 0, len(elems))
+		for _, el := range elems {
+			availableIndices = append(availableIndices, el.Index)
+		}
+		if len(availableIndices) > 0 {
+			pageMap["available_indices"] = availableIndices
+			pageMap["indices_range"] = fmt.Sprintf("%d-%d", availableIndices[0], availableIndices[len(availableIndices)-1])
+		}
 	}
 
 	// Build tools list safely - only include name and description to avoid schema issues
@@ -147,41 +172,228 @@ func (e *EmailAgent) Next(ctx context.Context, state State) (Decision, error) {
 		return e.fallbackDecision(state, err)
 	}
 
+	// Log LLM response for debugging
+	preview := resp.Text
+	if len(preview) > 200 {
+		preview = preview[:200] + "..."
+	}
+	fmt.Printf("[EmailAgent] LLM response preview: %s\n", preview)
+
 	dec, err := parseDecision(resp.Text)
 	if err != nil {
 		return Decision{}, fmt.Errorf("email agent decision parse: %w: raw=%q", err, resp.Text)
 	}
+
+	fmt.Printf("[EmailAgent] Parsed decision: action=%s\n", dec.ActionName)
+
 	return dec, nil
 }
 
 func (e *EmailAgent) buildEmailGuidance(state State) string {
-	guidance := fmt.Sprintf("EMAIL CLIENT: URL=%s, Title=%s, Elements=%d. ",
-		state.Summary.URL, state.Summary.Title, len(state.Summary.Elements))
+	// Show available indices range
+	availableIndices := make([]int, 0, len(state.Summary.Elements))
+	for _, el := range state.Summary.Elements {
+		availableIndices = append(availableIndices, el.Index)
+	}
+	indicesRange := ""
+	if len(availableIndices) > 0 {
+		indicesRange = fmt.Sprintf("Available indices: %d-%d. ", availableIndices[0], availableIndices[len(availableIndices)-1])
+	}
+
+	guidance := fmt.Sprintf("EMAIL CLIENT (snapshot: first 50 elements): URL=%s, Title=%s, Elements=%d. %s",
+		state.Summary.URL, state.Summary.Title, len(state.Summary.Elements), indicesRange)
+
+	// Detect current folder
+	isInSpamFolder := strings.Contains(state.Summary.URL, "#spam") || strings.Contains(state.Summary.Title, "Спам")
+	isInInbox := strings.Contains(state.Summary.URL, "#/tabs/relevant") || strings.Contains(state.Summary.URL, "#inbox") || strings.Contains(state.Summary.Title, "Входящие")
+
+	// Count emails processed from history
+	emailsRead := 0
+	emailsDeleted := 0
+	for _, item := range state.History {
+		if strings.Contains(item.URL, "/message/") {
+			emailsRead++
+		}
+		if item.Action == "click_selector" && strings.Contains(item.Result, "clicked selector #delete") {
+			emailsDeleted++
+		}
+	}
+
+	// Task completion logic
+	if strings.Contains(strings.ToLower(state.Task), "последние 10 писем") || strings.Contains(strings.ToLower(state.Task), "last 10 emails") {
+		if emailsRead >= 10 && emailsDeleted > 0 {
+			guidance += fmt.Sprintf("✅ TASK COMPLETE: Read %d emails, deleted %d spam emails. Use finish action with message summarizing what was done! ", emailsRead, emailsDeleted)
+		} else if emailsRead >= 10 {
+			guidance += fmt.Sprintf("✅ TASK COMPLETE: Read %d emails (no spam found). Use finish action! ", emailsRead)
+		} else {
+			guidance += fmt.Sprintf("Progress: Read %d/10 emails, deleted %d spam. Continue reading emails from INBOX (not Spam folder)! ", emailsRead, emailsDeleted)
+		}
+	}
+
+	// Prevent clicking on already active folder
+	if isInSpamFolder {
+		guidance += "🚨 CRITICAL: You are ALREADY in Spam folder! DO NOT click on 'Спам' again - you're already there! "
+		guidance += "If task was to read last 10 emails from INBOX and delete spam, you should NOT be in Spam folder. Go back to Inbox! "
+	}
+	if isInInbox {
+		guidance += "You are in INBOX folder. "
+	}
+
+	// Detect if we're viewing an email (not email list)
+	isViewingEmail := strings.Contains(state.Summary.Title, "Письмо") ||
+		strings.Contains(state.Summary.Title, "Письмо «") ||
+		strings.Contains(state.Summary.URL, "/message/") ||
+		strings.Contains(state.Summary.URL, "#/message/")
+
+	if isViewingEmail {
+		guidance += "🚨 CRITICAL: YOU ARE VIEWING AN EMAIL (not email list)! "
+		guidance += "The email is already open. You need to: "
+		guidance += "1) Check if this email is spam (look for spam indicators in text), "
+		guidance += "2) If spam, find and click DELETE button (look for 'удалить', 'delete', trash icon, or button with 'Удалить' text), "
+		guidance += "3) If not spam, go BACK to email list (look for 'Назад', 'Back', 'Входящие', or click on inbox link) to read next email. "
+		guidance += "DO NOT keep clicking on the email content - it's already open! "
+
+		// Look for delete button in snapshot
+		hasDeleteButton := false
+		for _, el := range state.Summary.Elements {
+			textLower := strings.ToLower(el.Text)
+			if strings.Contains(textLower, "удалить") ||
+				strings.Contains(textLower, "delete") ||
+				strings.Contains(textLower, "trash") ||
+				el.Role == "button" && (strings.Contains(textLower, "удал") || strings.Contains(textLower, "del")) {
+				guidance += fmt.Sprintf("FOUND DELETE BUTTON: [%d] %s:%q. Use click_by_index with index=%d to delete! ",
+					el.Index, el.Role, truncateText(el.Text, 30), el.Index)
+				hasDeleteButton = true
+				break
+			}
+		}
+		if !hasDeleteButton {
+			guidance += "Delete button not found in snapshot - try using read_page or look for buttons with 'удалить' text. "
+		}
+
+		// Look for back/inbox button
+		for _, el := range state.Summary.Elements {
+			textLower := strings.ToLower(el.Text)
+			if strings.Contains(textLower, "назад") ||
+				strings.Contains(textLower, "back") ||
+				strings.Contains(textLower, "входящие") ||
+				strings.Contains(textLower, "inbox") {
+				textPreview := el.Text
+				if len(textPreview) > 30 {
+					textPreview = textPreview[:30] + "..."
+				}
+				guidance += fmt.Sprintf("FOUND BACK/INBOX BUTTON: [%d] %s:%q. Use click_by_index with index=%d to go back to list! ",
+					el.Index, el.Role, textPreview, el.Index)
+				break
+			}
+		}
+	}
 
 	// Use email-specific DOM discovery
 	emailRows := e.findEmailRows(state.Summary.Elements)
 	if len(emailRows) > 0 {
-		guidance += fmt.Sprintf("FOUND %d EMAIL ROWS: ", len(emailRows))
+		guidance += fmt.Sprintf("FOUND %d EMAIL ROWS IN SNAPSHOT: ", len(emailRows))
 		maxShow := 10
 		if len(emailRows) < maxShow {
 			maxShow = len(emailRows)
 		}
 		for i := 0; i < maxShow; i++ {
 			el := emailRows[i]
-			// Show key info: role, first line of text, selector
+			// Show key info: index, role, first line of text (browser-use pattern)
 			textPreview := strings.Split(el.Text, "\n")[0]
 			if len(textPreview) > 50 {
 				textPreview = textPreview[:50] + "..."
 			}
-			guidance += fmt.Sprintf("[%d] role=%s text=%q selector=%s; ",
-				i+1, el.Role, textPreview, truncateText(el.Sel, 60))
+			guidance += fmt.Sprintf("[%d] %s:%q; ",
+				el.Index, el.Role, textPreview)
 		}
-		guidance += "These are email rows - click on them to read. "
+		// Show available indices range
+		if len(emailRows) > 0 {
+			guidance += fmt.Sprintf("Available email indices: %d-%d. ", emailRows[0].Index, emailRows[len(emailRows)-1].Index)
+		}
+		guidance += "🚨 CRITICAL: Use click_by_index with an index from the list above (e.g., click_by_index with index="
+		if len(emailRows) > 0 {
+			guidance += fmt.Sprintf("%d", emailRows[0].Index)
+		} else {
+			guidance += "1"
+		}
+		guidance += ") to click on emails! DO NOT use indices that are not in the list above! "
 	} else {
-		guidance += "NO EMAIL ROWS FOUND YET. "
+		// Count scroll attempts in history
+		scrollCount := 0
+		lastScrollWasUnchanged := false
+		for i := len(state.History) - 1; i >= 0 && i >= len(state.History)-5; i-- {
+			if state.History[i].Action == "scroll_page" {
+				scrollCount++
+			}
+			if state.History[i].Action == "observation" && strings.Contains(state.History[i].Result, "no changes after scroll") {
+				lastScrollWasUnchanged = true
+			}
+		}
+
+		guidance += "CRITICAL: NO EMAIL ROWS FOUND IN SNAPSHOT! "
+
+		// Check if collect_texts was used recently and returned results
+		hasCollectTextsResult := false
+		for i := len(state.History) - 1; i >= 0 && i >= len(state.History)-3; i-- {
+			if state.History[i].Action == "collect_texts" && strings.Contains(state.History[i].Result, "items") {
+				hasCollectTextsResult = true
+				break
+			}
+		}
+
+		// If multiple scrolls failed, FORCE use of collect_texts/read_page
+		if scrollCount >= 2 || lastScrollWasUnchanged {
+			guidance += "STOP SCROLLING! You've already tried scrolling " + fmt.Sprintf("%d", scrollCount) + " times and snapshot didn't change. "
+			guidance += "MANDATORY ACTION: You MUST use collect_texts(\"[role='option']\") or collect_texts(\"[data-testid*='message']\") or read_page() RIGHT NOW to find emails in iframe. "
+			guidance += "DO NOT use scroll_page again - it won't help! Emails are in iframe and require collect_texts/read_page to access. "
+		} else {
+			guidance += "Emails are likely in iframe. YOU MUST use collect_texts(\"[data-testid*='message']\") or collect_texts(\"[role='option']\") or read_page() to explore DOM and find emails. "
+			guidance += "Do NOT just scroll - use read_page or collect_texts to find the email list! "
+		}
+
+		// CRITICAL: If collect_texts was used and returned results, tell LLM to use indices from result
+		if hasCollectTextsResult {
+			guidance += "🚨 CRITICAL: You just used collect_texts and got results with INDICES! "
+			guidance += "The collect_texts result shows 'index' field for each email (e.g., items[0].index). "
+			guidance += "YOU MUST use click_by_index with the EXACT index from collect_texts result (e.g., click_by_index with index from items[0].index). "
+			guidance += "DO NOT use click_selector - use click_by_index with the index! "
+
+			// Find the last collect_texts result in history
+			for i := len(state.History) - 1; i >= 0 && i >= len(state.History)-3; i-- {
+				if state.History[i].Action == "collect_texts" {
+					// Extract index example from result if possible
+					result := state.History[i].Result
+					if strings.Contains(result, "index=") {
+						// Try to extract first index as example
+						if idx := strings.Index(result, "index="); idx > 0 {
+							idxStart := idx + len("index=")
+							idxEnd := strings.Index(result[idxStart:], "\n")
+							if idxEnd > 0 {
+								exampleIndex := result[idxStart : idxStart+idxEnd]
+								guidance += fmt.Sprintf("Example: use click_by_index with index=%s from collect_texts result! ", exampleIndex)
+							}
+						}
+					}
+					break
+				}
+			}
+		}
+
+		// Show scrollable elements if any (from browser-use pattern)
+		scrollableCount := 0
+		for _, el := range state.Summary.Elements {
+			if el.ScrollInfo != "" {
+				scrollableCount++
+			}
+		}
+		if scrollableCount > 0 {
+			guidance += fmt.Sprintf("Found %d scrollable containers in snapshot. ", scrollableCount)
+		}
+
 		// Show some elements for debugging
 		if len(state.Summary.Elements) > 0 {
-			guidance += "Showing first 5 elements for context: "
+			guidance += "Showing first 5 snapshot elements for context: "
 			maxShow := 5
 			if len(state.Summary.Elements) < maxShow {
 				maxShow = len(state.Summary.Elements)
@@ -192,8 +404,14 @@ func (e *EmailAgent) buildEmailGuidance(state State) string {
 				if len(textPreview) > 30 {
 					textPreview = textPreview[:30] + "..."
 				}
-				guidance += fmt.Sprintf("[%d]%s:%q ", i+1, el.Role, textPreview)
+				scrollInfoText := ""
+				if el.ScrollInfo != "" {
+					scrollInfoText = " (scroll: " + el.ScrollInfo + ")"
+				}
+				guidance += fmt.Sprintf("[%d]%s:%q%s ", i+1, el.Role, textPreview, scrollInfoText)
 			}
+		} else {
+			guidance += "SNAPSHOT IS COMPLETELY EMPTY - use read_page() immediately to see page content!"
 		}
 	}
 
@@ -244,6 +462,12 @@ func (e *EmailAgent) isEmailRow(el snapshot.Element) bool {
 	roleLower := strings.ToLower(el.Role)
 	selLower := strings.ToLower(el.Sel)
 	attrLower := strings.ToLower(el.Attr)
+
+	// Exclude layout elements (not actual emails)
+	if strings.Contains(selLower, "-header") || strings.Contains(selLower, "-footer") ||
+		strings.Contains(selLower, "-layout") && !strings.Contains(selLower, "content") {
+		return false
+	}
 
 	// Yandex Mail specific patterns
 	// Pattern 1: data-testid with "message" or "mail" or "item"
@@ -466,10 +690,6 @@ func (e *EmailAgent) fallbackDecision(state State, llmErr error) (Decision, erro
 						strings.Contains(textLower, "trash") ||
 						strings.Contains(attrLower, "delete") {
 						if el.Sel != "" {
-							// Track deletion in memory if available
-							if state.Memory != nil {
-								state.Memory.EmailsDeleted++
-							}
 							return Decision{
 								ActionName:  "click_selector",
 								ActionInput: map[string]any{"selector": el.Sel},
@@ -509,18 +729,6 @@ func (e *EmailAgent) fallbackDecision(state State, llmErr error) (Decision, erro
 
 	// If we're on mail page but no emails found, try scrolling
 	if strings.Contains(urlLower, "mail") {
-		// Check if we've read enough emails (task says "последние 10 писем")
-		if state.Memory != nil && state.Memory.EmailsRead >= 10 {
-			return Decision{
-				ActionName: "finish",
-				ActionInput: map[string]any{
-					"message": fmt.Sprintf("Прочитано %d писем, удалено %d спам-писем",
-						state.Memory.EmailsRead, state.Memory.EmailsDeleted),
-				},
-				Finish: true,
-			}, nil
-		}
-
 		emailRows := e.findEmailRows(state.Summary.Elements)
 		if len(emailRows) == 0 {
 			// Try scrolling to load emails
@@ -538,85 +746,78 @@ func (e *EmailAgent) fallbackDecision(state State, llmErr error) (Decision, erro
 			}, nil
 		}
 
-		// If we have emails, try clicking next unprocessed one
+		// If we have emails, find one that hasn't failed recently
 		if len(emailRows) > 0 {
-			// Get lists of processed/deleted email URLs and selectors from memory
-			processedSelectors := make(map[string]bool)
-			if state.Memory != nil {
-				for _, sel := range state.Memory.ProcessedSelectors {
-					processedSelectors[sel] = true
+			// Build set of failed selectors from recent history (last 5 actions)
+			failedSelectors := make(map[string]int) // selector -> failure count
+			currentInboxURL := state.Summary.URL
+
+			// Check last 5 actions for failed click_selector attempts in inbox
+			for i := len(state.History) - 1; i >= 0 && i >= len(state.History)-5; i-- {
+				item := state.History[i]
+				if item.Action == "click_selector" &&
+					strings.Contains(item.Result, "error") &&
+					strings.Contains(item.URL, "/tabs/relevant") &&
+					strings.Contains(currentInboxURL, "/tabs/relevant") &&
+					item.Selector != "" {
+					failedSelectors[item.Selector]++
 				}
 			}
 
-			// Try to find email that hasn't been processed yet
-			// Check both selector and URL context to avoid repeats
-			var lastSelector string
-			var lastURL string
-			if len(state.History) > 0 {
-				lastAction := state.History[len(state.History)-1]
-				lastSelector = lastAction.Selector
-				lastURL = lastAction.URL
-			}
-
-			// Try to find email with unprocessed selector in current context
+			// Try to find an email that hasn't failed (or failed only once)
 			for _, email := range emailRows {
 				if email.Sel != "" {
-					// Skip if this selector was already processed in this URL context
-					selectorKey := email.Sel + ":" + state.Summary.URL
-					if processedSelectors[selectorKey] {
-						continue
-					}
-					// Skip if this selector was just used in same URL context
-					if email.Sel == lastSelector && state.Summary.URL == lastURL {
-						continue
-					}
-					// This is a new email to process
-					return Decision{
-						ActionName:  "click_selector",
-						ActionInput: map[string]any{"selector": email.Sel},
-					}, nil
-				}
-			}
-
-			// If all emails have same selector pattern or were processed, try first unprocessed
-			// Check if we've processed all visible emails
-			allProcessed := true
-			for _, email := range emailRows {
-				if email.Sel != "" {
-					selectorKey := email.Sel + ":" + state.Summary.URL
-					if !processedSelectors[selectorKey] && !(email.Sel == lastSelector && state.Summary.URL == lastURL) {
-						allProcessed = false
-						break
+					failCount := failedSelectors[email.Sel]
+					// Skip if this selector failed 2+ times
+					if failCount < 2 {
+						return Decision{
+							ActionName:  "click_selector",
+							ActionInput: map[string]any{"selector": email.Sel},
+						}, nil
 					}
 				}
 			}
 
-			if allProcessed {
-				// All visible emails processed - try scrolling or finish
-				if state.Memory != nil && state.Memory.EmailsRead >= 10 {
-					return Decision{
-						ActionName: "finish",
-						ActionInput: map[string]any{
-							"message": fmt.Sprintf("Прочитано %d писем, удалено %d спам-писем",
-								state.Memory.EmailsRead, state.Memory.EmailsDeleted),
-						},
-						Finish: true,
-					}, nil
-				}
-				// Try scrolling to load more emails
+			// If all emails failed multiple times, try scrolling to load new emails
+			scrollCount := e.countScrolls(state.History)
+			if scrollCount < 5 {
 				return Decision{
 					ActionName:  "scroll_page",
 					ActionInput: map[string]any{"direction": "down", "distance": 300},
 				}, nil
 			}
 
-			// Fallback: click first email (will be tracked after opening)
+			// Last resort: try first email anyway (maybe list refreshed)
 			firstEmail := emailRows[0]
 			if firstEmail.Sel != "" {
 				return Decision{
 					ActionName:  "click_selector",
 					ActionInput: map[string]any{"selector": firstEmail.Sel},
 				}, nil
+			}
+		}
+
+		// If no email rows found but we're in inbox, try more aggressive search
+		// Look for any clickable elements that might be emails (even if not detected by isEmailRow)
+		if len(emailRows) == 0 && strings.Contains(urlLower, "/tabs/relevant") {
+			// Try to find elements with role="option" or role="row" (Yandex Mail specific)
+			for _, el := range state.Summary.Elements {
+				roleLower := strings.ToLower(el.Role)
+				selLower := strings.ToLower(el.Sel)
+				// Skip layout elements
+				if strings.Contains(selLower, "-header") || strings.Contains(selLower, "-footer") ||
+					strings.Contains(selLower, "-layout") && !strings.Contains(selLower, "content") {
+					continue
+				}
+				// Look for email-like elements
+				if (roleLower == "option" || roleLower == "row" || roleLower == "listitem") &&
+					el.Sel != "" && len(el.Text) > 10 {
+					// Found potential email - try clicking it
+					return Decision{
+						ActionName:  "click_selector",
+						ActionInput: map[string]any{"selector": el.Sel},
+					}, nil
+				}
 			}
 		}
 	}

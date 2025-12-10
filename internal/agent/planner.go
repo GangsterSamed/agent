@@ -15,12 +15,18 @@ const systemPrompt = `You are a fast, deterministic browser agent.
 CRITICAL RULES:
 1. Use ONLY the provided tools.
 2. Respond with a SINGLE JSON object and NOTHING else: {"action": "...", "input": {...}}
-3. BEFORE any action, ALWAYS check snapshot.elements array - it contains visible clickable elements.
-4. Prefer click_role with name (from snapshot.elements[].text or aria-label) > click_selector > click_text.
-5. Use scroll_page if target elements are not visible in current snapshot. Heavy SPAs (like email clients) may need multiple scrolls to load content.
-6. After clicking a folder/link, the page will update - check new snapshot.elements for the content.
-7. If task is done: {"action":"finish","input":{"message":"..."}}.
-8. For risky actions (payment/delete): ask user via request_user_input.`
+3. BEFORE any action, ALWAYS check snapshot.elements array FIRST - it contains the top 50 most relevant visible clickable elements (chunking pattern for speed).
+4. If target elements are NOT in snapshot.elements, use read_page or collect_texts to explore DOM (especially for iframe content like email lists).
+5. Prefer click_role with name (from snapshot.elements[].text or aria-label) > click_selector > click_text.
+6. Use scroll_page if target elements are not visible in current snapshot. Heavy SPAs (like email clients) may need multiple scrolls to load content.
+7. After clicking a folder/link, the page will update - check new snapshot.elements for the content.
+8. If task is done: {"action":"finish","input":{"message":"..."}}.
+9. For risky actions (payment/delete): ask user via request_user_input.
+
+CHUNKING STRATEGY:
+- Snapshot shows first 50 most relevant elements (fast, token-efficient).
+- If you don't see target elements in snapshot, use read_page(selector) or collect_texts(selector) to explore specific DOM areas.
+- This allows you to investigate iframe content, shadow DOM, or dynamically loaded elements that snapshot might miss.`
 
 type Planner interface {
 	Next(ctx context.Context, state State) (Decision, error)
@@ -32,7 +38,6 @@ type State struct {
 	History []HistoryItem
 	Summary snapshot.Summary
 	Tools   []tools.Tool
-	Memory  *TaskMemory // Persistent memory for task context
 }
 
 type HistoryItem struct {
@@ -60,8 +65,8 @@ func NewPlanner(client llm.Client) Planner {
 func (p *fastPlanner) Next(ctx context.Context, state State) (Decision, error) {
 	guidance := fmt.Sprintf("SNAPSHOT: URL=%s, Title=%s, Elements=%d. ", state.Summary.URL, state.Summary.Title, len(state.Summary.Elements))
 	if len(state.Summary.Elements) > 0 {
-		guidance += "EXAMPLE ELEMENTS (first 8): "
-		maxExamples := 8
+		guidance += "EXAMPLE ELEMENTS (first 10): "
+		maxExamples := 10
 		if len(state.Summary.Elements) < maxExamples {
 			maxExamples = len(state.Summary.Elements)
 		}
@@ -69,9 +74,14 @@ func (p *fastPlanner) Next(ctx context.Context, state State) (Decision, error) {
 			el := state.Summary.Elements[i]
 			guidance += fmt.Sprintf("[%d] role=%s text=%q selector=%s; ", i+1, el.Role, el.Text, el.Sel)
 		}
-		guidance += fmt.Sprintf("Check snapshot.elements for target items. Use click_role with name from element.text/attr OR click_selector with element.selector. If target not found, use scroll_page to load more content (heavy SPAs load dynamically).")
+		guidance += fmt.Sprintf("Check snapshot.elements for target items. Use click_role with name from element.text/attr OR click_selector with element.selector.")
 	} else {
-		guidance += "No elements found - page may be loading. Use wait_for or navigate."
+		guidance += "CRITICAL: No elements in snapshot! Use read_page() or collect_texts() to explore DOM, especially for iframe content. For email tasks, try collect_texts(\"[data-testid*='message']\") or read_page() to find email list."
+	}
+
+	// CRITICAL: If snapshot is empty or has very few elements, force LLM to use read_page/collect_texts
+	if len(state.Summary.Elements) < 5 {
+		guidance += " SNAPSHOT IS EMPTY - YOU MUST use read_page() or collect_texts() to explore the page! Do NOT just scroll!"
 	}
 
 	payload := map[string]any{

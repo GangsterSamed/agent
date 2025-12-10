@@ -33,17 +33,12 @@ type Orchestrator struct {
 }
 
 type TaskMemory struct {
-	InInbox            bool
-	ScrollCount        int
-	EmailsSeen         int
-	LastSnapshot       snapshot.Summary
-	LastAction         string
-	EmailElements      []snapshot.Element
-	ProcessedEmailURLs []string // URLs of emails that have been opened/processed
-	DeletedEmailURLs   []string // URLs of emails that have been deleted
-	ProcessedSelectors []string // Selectors that have been clicked (to avoid repeats)
-	EmailsRead         int      // Count of emails read
-	EmailsDeleted      int      // Count of emails deleted
+	InInbox       bool
+	ScrollCount   int
+	EmailsSeen    int
+	LastSnapshot  snapshot.Summary
+	LastAction    string
+	EmailElements []snapshot.Element
 }
 
 type errorRecord struct {
@@ -71,38 +66,60 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 			return err
 		}
 
-		// Longer delay after navigation to let heavy SPAs (like email clients) load
+		// Wait for stable DOM after navigation (event-driven, not fixed sleep)
 		if len(history) > 0 && history[len(history)-1].Action == "navigate" {
-			time.Sleep(5 * time.Second)
+			// Use WaitForStableDOM instead of fixed sleep for better performance
+			if err := o.tools.WaitForStableDOM(ctx, 5*time.Second); err != nil {
+				o.logger.Debug().Err(err).Msg("wait for stable DOM after navigate")
+			}
 		}
 
 		// Re-observation loop: always get fresh snapshot at start of each step
+		// For email tasks, wait for email elements to appear before snapshot
+		if len(o.subAgents) > 0 {
+			for _, subAgent := range o.subAgents {
+				if subAgent.CanHandle(task.Description) {
+					// Wait for email elements to load (for email clients like Yandex Mail)
+					_, err := o.tools.Invoke(ctx, "wait_for_emails", map[string]any{"timeout_ms": 5000})
+					if err != nil {
+						// Ignore error - emails might already be loaded
+						o.logger.Debug().Err(err).Msg("wait_for_emails")
+					}
+					break
+				}
+			}
+		}
+
 		ctxSnap, cancel := snapshot.WithDeadline(ctx, 5*time.Second)
 		summary, _ := snap(ctxSnap)
 		cancel()
 
-		// Debug: show snapshot info
-		if step <= 5 || len(summary.Elements) == 0 {
-			// Show first few elements for debugging
-			elemPreview := ""
-			if len(summary.Elements) > 0 {
-				maxPreview := 5
-				if len(summary.Elements) < maxPreview {
-					maxPreview = len(summary.Elements)
-				}
-				for i := 0; i < maxPreview; i++ {
-					el := summary.Elements[i]
-					elemPreview += fmt.Sprintf(" [%d]%s:%q", i+1, el.Role, truncateTextForDebug(el.Text, 30))
-				}
+		// ALWAYS log snapshot info for debugging (especially for email tasks)
+		elemPreview := ""
+		if len(summary.Elements) > 0 {
+			maxPreview := 10
+			if len(summary.Elements) < maxPreview {
+				maxPreview = len(summary.Elements)
 			}
-			o.logger.Debug().
-				Int("step", step).
-				Str("url", summary.URL).
-				Str("title", summary.Title).
-				Int("elements", len(summary.Elements)).
-				Str("preview", elemPreview).
-				Msg("snapshot")
+			for i := 0; i < maxPreview; i++ {
+				el := summary.Elements[i]
+				scrollInfoText := ""
+				if el.ScrollInfo != "" {
+					scrollInfoText = " (scroll:" + el.ScrollInfo + ")"
+				}
+				// Use element's index (browser-use pattern)
+				elemPreview += fmt.Sprintf(" [%d]%s:%q%s", el.Index, el.Role, truncateTextForDebug(el.Text, 40), scrollInfoText)
+			}
+		} else {
+			elemPreview = "EMPTY - no elements found!"
 		}
+		o.logger.Info().
+			Int("step", step).
+			Str("url", summary.URL).
+			Str("title", summary.Title).
+			Int("elements", len(summary.Elements)).
+			Str("preview", elemPreview).
+			Msg("snapshot")
 
 		state := State{
 			Task:    task.Description,
@@ -110,7 +127,6 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 			History: last(history, 5),
 			Summary: summary,
 			Tools:   o.tools.Describe(),
-			Memory:  o.memory, // Pass memory to sub-agents
 		}
 
 		// Sub-agent architecture: delegate to specialized agent if available
@@ -157,6 +173,50 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 		if dec.ActionName == "scroll_page" {
 			limit = 20 // allow many scrolls for heavy SPAs that load content dynamically
 		}
+		if dec.ActionName == "click_by_index" {
+			limit = 2 // Strict limit for click_by_index - prevent loops
+		}
+
+		// Prevent clicking on already active folder (e.g., clicking "Спам" when already in Spam folder)
+		if dec.ActionName == "click_by_index" || dec.ActionName == "click_selector" {
+			index, hasIndex := dec.ActionInput["index"]
+			selector, hasSelector := dec.ActionInput["selector"].(string)
+
+			// Check if clicking on Spam folder when already in Spam
+			if strings.Contains(summary.URL, "#spam") || strings.Contains(summary.Title, "Спам") {
+				if hasIndex {
+					// Find element by index
+					var foundElement *snapshot.Element
+					for i := range summary.Elements {
+						if summary.Elements[i].Index == int(index.(float64)) {
+							foundElement = &summary.Elements[i]
+							break
+						}
+					}
+					if foundElement != nil && strings.Contains(strings.ToLower(foundElement.Text), "спам") {
+						o.logger.Warn().
+							Int("index", int(index.(float64))).
+							Msg("preventing click on already active Spam folder")
+						// Skip this action and continue
+						history = append(history, HistoryItem{
+							Action: "observation",
+							Result: "skipped: already in Spam folder, don't click on it again",
+							URL:    summary.URL,
+						})
+						continue
+					}
+				}
+				if hasSelector && (strings.Contains(selector, "Спам") || strings.Contains(strings.ToLower(selector), "spam")) {
+					o.logger.Warn().Str("selector", selector).Msg("preventing click on already active Spam folder")
+					history = append(history, HistoryItem{
+						Action: "observation",
+						Result: "skipped: already in Spam folder, don't click on it again",
+						URL:    summary.URL,
+					})
+					continue
+				}
+			}
+		}
 		// Pass URL context for tooManyRepeats check
 		checkInput := make(map[string]any)
 		for k, v := range dec.ActionInput {
@@ -164,7 +224,7 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 		}
 		checkInput["_url"] = summary.URL
 		if tooManyRepeats(history, dec.ActionName, checkInput, limit) {
-			return fmt.Errorf("too many repeated actions: %s", dec.ActionName)
+			return fmt.Errorf("too many repeated actions: %s (limit: %d). Try a different action", dec.ActionName, limit)
 		}
 
 		// Security layer: check for destructive actions
@@ -193,70 +253,169 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 		// Update memory
 		o.updateMemory(dec.ActionName, summary)
 
-		// Before clicking on email, check if selector was already processed
-		if dec.ActionName == "click_selector" {
-			if sel, ok := dec.ActionInput["selector"].(string); ok {
-				// Check if this selector was already processed in this context
-				if o.memory != nil {
-					selectorKey := sel + ":" + summary.URL
-					for _, processedSel := range o.memory.ProcessedSelectors {
-						if processedSel == selectorKey {
-							// This selector was already clicked in this context - skip and get new decision
-							o.logger.Info().
-								Str("selector", sel).
-								Str("url", summary.URL).
-								Msg("skipping already processed selector, getting new decision")
-							// Update snapshot and get new decision
-							time.Sleep(500 * time.Millisecond)
-							ctxSnapSkip, cancelSkip := snapshot.WithDeadline(ctx, 3*time.Second)
-							summarySkip, _ := snap(ctxSnapSkip)
-							cancelSkip()
-							summary = summarySkip
-							state := State{
-								Task:    task.Description,
-								Step:    step,
-								History: last(history, 5),
-								Summary: summary,
-								Tools:   o.tools.Describe(),
-								Memory:  o.memory,
-							}
-							// Get new decision from planner/sub-agent
-							subAgent := o.selectSubAgent(task.Description)
-							if subAgent != nil {
-								dec, err = subAgent.Next(ctx, state)
-							} else {
-								dec, err = o.planner.Next(ctx, state)
-							}
-							if err != nil {
-								return fmt.Errorf("planner: %w", err)
-							}
-							// Continue with new decision
-							continue
-						}
-					}
-					// Mark selector as processed before clicking (with URL context)
-					// selectorKey already declared above
-					o.memory.ProcessedSelectors = append(o.memory.ProcessedSelectors, selectorKey)
-					// Keep only last 20 selectors to avoid memory bloat
-					if len(o.memory.ProcessedSelectors) > 20 {
-						o.memory.ProcessedSelectors = o.memory.ProcessedSelectors[len(o.memory.ProcessedSelectors)-20:]
-					}
+		// Handle click_by_index: convert to click_selector using element from snapshot (browser-use pattern)
+		var foundElement *snapshot.Element // Keep reference for bbox fallback
+		if dec.ActionName == "click_by_index" {
+			index, ok := dec.ActionInput["index"].(float64)
+			if !ok {
+				indexInt, okInt := dec.ActionInput["index"].(int)
+				if okInt {
+					index = float64(indexInt)
+				} else {
+					return fmt.Errorf("invalid index type for click_by_index")
 				}
 			}
+			indexInt := int(index)
+
+			// Find element by index in snapshot
+			for i := range summary.Elements {
+				if summary.Elements[i].Index == indexInt {
+					foundElement = &summary.Elements[i]
+					break
+				}
+			}
+
+			if foundElement == nil {
+				// Build list of available indices for better error message
+				availableIndices := make([]int, 0, len(summary.Elements))
+				for _, el := range summary.Elements {
+					availableIndices = append(availableIndices, el.Index)
+				}
+				return fmt.Errorf("element with index %d not found in current snapshot. Available indices: %v. Use an index from the current snapshot", indexInt, availableIndices)
+			}
+
+			// Browser-use pattern: don't check DOM existence - just try to click
+			// If selector doesn't work, fallback to coordinates from bbox
+			// This handles virtualized lists and iframes better
+
+			// Convert to click_selector
+			o.logger.Debug().
+				Int("index", indexInt).
+				Str("selector", foundElement.Sel).
+				Str("text", truncateTextForDebug(foundElement.Text, 30)).
+				Str("bbox", foundElement.BBox).
+				Msg("converting click_by_index to click_selector")
+
+			dec.ActionName = "click_selector"
+			dec.ActionInput = map[string]any{"selector": foundElement.Sel}
 		}
 
 		result, err := o.tools.Invoke(ctx, dec.ActionName, dec.ActionInput)
 		if err != nil {
-			// Check if error is selector parsing error - skip retry for invalid selectors
-			errorType := o.analyzeError(err)
-			if errorType == "selector_parse_error" {
+			// Browser-use pattern: if click_selector fails and we have bbox, try coordinates
+			if dec.ActionName == "click_selector" && foundElement != nil && foundElement.BBox != "" {
+				// Parse bbox: "x,y,width,height" -> center point
+				var x, y, w, h float64
+				if n, _ := fmt.Sscanf(foundElement.BBox, "%f,%f,%f,%f", &x, &y, &w, &h); n == 4 {
+					// Click at center of bbox
+					centerX := x + w/2
+					centerY := y + h/2
+					o.logger.Info().
+						Float64("x", centerX).
+						Float64("y", centerY).
+						Str("bbox", foundElement.BBox).
+						Msg("click_selector failed, trying click_coordinates from bbox")
+
+					coordResult, coordErr := o.tools.Invoke(ctx, "click_coordinates", map[string]any{
+						"x": int(centerX),
+						"y": int(centerY),
+					})
+					if coordErr == nil {
+						// Success with coordinates!
+						result = coordResult
+						err = nil
+						o.logger.Info().Msg("click_coordinates succeeded as fallback")
+					}
+				}
+			}
+
+			if err != nil {
+				// Check if error is selector parsing error - skip retry for invalid selectors
+				errorType := o.analyzeError(err)
+				if errorType == "selector_parse_error" {
+					o.logger.Warn().
+						Err(err).
+						Str("action", dec.ActionName).
+						Msg("selector parse error - skipping retry, will try alternative")
+					item := HistoryItem{
+						Action: dec.ActionName,
+						Result: "error: invalid selector",
+						URL:    summary.URL,
+					}
+					if dec.ActionName == "click_selector" {
+						if sel, ok := dec.ActionInput["selector"].(string); ok {
+							item.Selector = sel
+						}
+					}
+					history = append(history, item)
+					// Update snapshot and continue
+					time.Sleep(500 * time.Millisecond)
+					ctxSnapErr, cancelErr := snapshot.WithDeadline(ctx, 3*time.Second)
+					summaryErr, _ := snap(ctxSnapErr)
+					cancelErr()
+					summary = summaryErr
+					continue
+				}
+
+				// Record error for adaptive handling
+				o.errorHistory = append(o.errorHistory, errorRecord{
+					action:    dec.ActionName,
+					errorType: errorType,
+					step:      step,
+					timestamp: time.Now(),
+				})
+				// Keep only last 10 errors
+				if len(o.errorHistory) > 10 {
+					o.errorHistory = o.errorHistory[len(o.errorHistory)-10:]
+				}
+
 				o.logger.Warn().
 					Err(err).
 					Str("action", dec.ActionName).
-					Msg("selector parse error - skipping retry, will try alternative")
+					Str("error_type", errorType).
+					Msg("tool error")
+
+				// Re-observation: update snapshot before retry
+				time.Sleep(500 * time.Millisecond) // Wait for DOM to settle
+				ctxSnapRetry, cancelRetry := snapshot.WithDeadline(ctx, 3*time.Second)
+				freshSummary, _ := snap(ctxSnapRetry)
+				cancelRetry()
+
+				// Adaptive error handling: try multiple strategies with fresh snapshot
+				recoveredAction, recoveredResult, success := o.handleErrorAdaptively(ctx, dec, freshSummary, snap, history, step)
+				if success {
+					// Successfully recovered from error
+					item := HistoryItem{
+						Action: recoveredAction,
+						Result: recoveredResult.Observation,
+						URL:    freshSummary.URL,
+					}
+					if recoveredAction == "click_selector" {
+						// Try to extract selector from original decision
+						if sel, ok := dec.ActionInput["selector"].(string); ok {
+							item.Selector = sel
+						}
+					}
+					history = append(history, item)
+					fmt.Printf("agent[%d]: %s (recovered) -> %s\n", step, recoveredAction, truncate(recoveredAction, recoveredResult.Observation))
+					// Re-observation loop: update snapshot after successful recovery
+					time.Sleep(800 * time.Millisecond)
+					ctxSnapAfter, cancelAfter := snapshot.WithDeadline(ctx, 3*time.Second)
+					summaryAfter, _ := snap(ctxSnapAfter)
+					cancelAfter()
+					summary = summaryAfter // Update summary for next iteration
+					o.updateMemory(recoveredAction, summaryAfter)
+					// Delay after click actions
+					if recoveredAction == "click_role" || recoveredAction == "click_selector" || recoveredAction == "click_text" {
+						time.Sleep(1 * time.Second)
+					}
+					continue
+				}
+
+				// All recovery strategies failed
 				item := HistoryItem{
 					Action: dec.ActionName,
-					Result: "error: invalid selector",
+					Result: "error: " + err.Error(),
 					URL:    summary.URL,
 				}
 				if dec.ActionName == "click_selector" {
@@ -265,90 +424,15 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 					}
 				}
 				history = append(history, item)
-				// Update snapshot and continue
+				// Re-observation: update snapshot even after error to see what changed
 				time.Sleep(500 * time.Millisecond)
 				ctxSnapErr, cancelErr := snapshot.WithDeadline(ctx, 3*time.Second)
 				summaryErr, _ := snap(ctxSnapErr)
 				cancelErr()
-				summary = summaryErr
+				summary = summaryErr // Update summary for next iteration
+				// Don't give up immediately - let planner decide next action with fresh snapshot
 				continue
 			}
-
-			// Record error for adaptive handling
-			o.errorHistory = append(o.errorHistory, errorRecord{
-				action:    dec.ActionName,
-				errorType: errorType,
-				step:      step,
-				timestamp: time.Now(),
-			})
-			// Keep only last 10 errors
-			if len(o.errorHistory) > 10 {
-				o.errorHistory = o.errorHistory[len(o.errorHistory)-10:]
-			}
-
-			o.logger.Warn().
-				Err(err).
-				Str("action", dec.ActionName).
-				Str("error_type", errorType).
-				Msg("tool error")
-
-			// Re-observation: update snapshot before retry
-			time.Sleep(500 * time.Millisecond) // Wait for DOM to settle
-			ctxSnapRetry, cancelRetry := snapshot.WithDeadline(ctx, 3*time.Second)
-			freshSummary, _ := snap(ctxSnapRetry)
-			cancelRetry()
-
-			// Adaptive error handling: try multiple strategies with fresh snapshot
-			recoveredAction, recoveredResult, success := o.handleErrorAdaptively(ctx, dec, freshSummary, snap, history, step)
-			if success {
-				// Successfully recovered from error
-				item := HistoryItem{
-					Action: recoveredAction,
-					Result: recoveredResult.Observation,
-					URL:    freshSummary.URL,
-				}
-				if recoveredAction == "click_selector" {
-					// Try to extract selector from original decision
-					if sel, ok := dec.ActionInput["selector"].(string); ok {
-						item.Selector = sel
-					}
-				}
-				history = append(history, item)
-				fmt.Printf("agent[%d]: %s (recovered) -> %s\n", step, recoveredAction, truncate(recoveredAction, recoveredResult.Observation))
-				// Re-observation loop: update snapshot after successful recovery
-				time.Sleep(800 * time.Millisecond)
-				ctxSnapAfter, cancelAfter := snapshot.WithDeadline(ctx, 3*time.Second)
-				summaryAfter, _ := snap(ctxSnapAfter)
-				cancelAfter()
-				summary = summaryAfter // Update summary for next iteration
-				o.updateMemory(recoveredAction, summaryAfter)
-				// Delay after click actions
-				if recoveredAction == "click_role" || recoveredAction == "click_selector" || recoveredAction == "click_text" {
-					time.Sleep(1 * time.Second)
-				}
-				continue
-			}
-
-			// All recovery strategies failed
-			item := HistoryItem{
-				Action: dec.ActionName,
-				Result: "error: " + err.Error(),
-				URL:    summary.URL,
-			}
-			if dec.ActionName == "click_selector" {
-				if sel, ok := dec.ActionInput["selector"].(string); ok {
-					item.Selector = sel
-				}
-			}
-			history = append(history, item)
-			// Re-observation: update snapshot even after error to see what changed
-			time.Sleep(500 * time.Millisecond)
-			ctxSnapErr, cancelErr := snapshot.WithDeadline(ctx, 3*time.Second)
-			summaryErr, _ := snap(ctxSnapErr)
-			cancelErr()
-			summary = summaryErr // Update summary for next iteration
-			// Don't give up immediately - let planner decide next action with fresh snapshot
-			continue
 		}
 		fmt.Printf("agent[%d]: %s -> %s\n", step, dec.ActionName, truncate(dec.ActionName, result.Observation))
 		// Create history item with selector and URL context
@@ -375,10 +459,13 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 				o.logger.Info().Msg("snapshot unchanged after scroll - stopping scroll loop")
 				history = append(history, HistoryItem{
 					Action: "observation",
-					Result: "no changes after scroll - emails may be fully loaded",
+					Result: "no changes after scroll - emails may be in iframe, use collect_texts or read_page",
 				})
+				// Update summary to reflect that scroll didn't help
+				summary = stableSummary
+			} else {
+				summary = stableSummary
 			}
-			summary = stableSummary
 		} else {
 			// Re-observation loop: update snapshot after every action
 			time.Sleep(800 * time.Millisecond) // Wait for DOM to update after action
@@ -386,64 +473,11 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 			summaryAfter, _ := snap(ctxSnapAfter)
 			cancelAfter()
 
-			// If we just clicked on an email and now viewing it, mark as processed immediately
-			if dec.ActionName == "click_selector" {
-				if strings.Contains(summaryAfter.URL, "/message/") {
-					if o.memory != nil {
-						found := false
-						for _, url := range o.memory.ProcessedEmailURLs {
-							if url == summaryAfter.URL {
-								found = true
-								break
-							}
-						}
-						if !found {
-							o.memory.ProcessedEmailURLs = append(o.memory.ProcessedEmailURLs, summaryAfter.URL)
-							o.memory.EmailsRead++
-						}
-					}
-				}
-			}
-
 			summary = summaryAfter // Update summary for next iteration
 		}
 
 		// Update memory after action
 		o.updateMemory(dec.ActionName, summary)
-
-		// After successful click_selector, check if we need to track deletion or email opening
-		if dec.ActionName == "click_selector" {
-			if sel, ok := dec.ActionInput["selector"].(string); ok {
-				// Check if this was a delete action
-				if strings.Contains(sel, "delete") || strings.Contains(result.Observation, "delete") {
-					// Mark email URL as deleted
-					if o.memory != nil {
-						// Look for last email URL in history
-						var emailURL string
-						for i := len(history) - 1; i >= 0; i-- {
-							if strings.Contains(history[i].URL, "/message/") {
-								emailURL = history[i].URL
-								break
-							}
-						}
-						if emailURL != "" {
-							// Add to deleted list if not already there
-							found := false
-							for _, url := range o.memory.DeletedEmailURLs {
-								if url == emailURL {
-									found = true
-									break
-								}
-							}
-							if !found {
-								o.memory.DeletedEmailURLs = append(o.memory.DeletedEmailURLs, emailURL)
-								o.memory.EmailsDeleted++
-							}
-						}
-					}
-				}
-			}
-		}
 
 		// Delay after click actions to let heavy SPAs update
 		if dec.ActionName == "click_role" || dec.ActionName == "click_selector" || dec.ActionName == "click_text" {
@@ -490,7 +524,7 @@ func tooManyRepeats(history []HistoryItem, action string, input map[string]any, 
 	// For click_selector, check action + selector + URL context
 	if action == "click_selector" {
 		selector, _ := input["selector"].(string)
-		currentURL := "" // Will be passed from summary
+		currentURL := ""
 		if url, ok := input["_url"].(string); ok {
 			currentURL = url
 		}
@@ -500,6 +534,23 @@ func tooManyRepeats(history []HistoryItem, action string, input map[string]any, 
 			if history[i].Action == action &&
 				history[i].Selector == selector &&
 				history[i].URL == currentURL {
+				count++
+			}
+		}
+		return count >= limit
+	}
+
+	// For click_by_index, check by action + URL (strict limit to prevent loops)
+	if action == "click_by_index" {
+		currentURL := ""
+		if url, ok := input["_url"].(string); ok {
+			currentURL = url
+		}
+
+		count := 0
+		for i := len(history) - 1; i >= 0 && i >= len(history)-limit; i-- {
+			if history[i].Action == action && history[i].URL == currentURL {
+				// Same action on same URL - likely a loop
 				count++
 			}
 		}
@@ -973,11 +1024,7 @@ func (o *Orchestrator) selectSubAgent(task string) SubAgent {
 // updateMemory updates persistent memory about task progress
 func (o *Orchestrator) updateMemory(action string, summary snapshot.Summary) {
 	if o.memory == nil {
-		o.memory = &TaskMemory{
-			ProcessedEmailURLs: make([]string, 0),
-			DeletedEmailURLs:   make([]string, 0),
-			ProcessedSelectors: make([]string, 0),
-		}
+		o.memory = &TaskMemory{}
 	}
 	o.memory.LastAction = action
 	o.memory.LastSnapshot = summary
@@ -988,22 +1035,6 @@ func (o *Orchestrator) updateMemory(action string, summary snapshot.Summary) {
 	if strings.Contains(urlLower, "inbox") || strings.Contains(urlLower, "входящие") ||
 		strings.Contains(titleLower, "входящие") || strings.Contains(titleLower, "inbox") {
 		o.memory.InInbox = true
-	}
-
-	// Track processed email URLs - immediately when we open an email
-	if strings.Contains(summary.URL, "/message/") {
-		// This is an email view - add to processed if not already there
-		found := false
-		for _, url := range o.memory.ProcessedEmailURLs {
-			if url == summary.URL {
-				found = true
-				break
-			}
-		}
-		if !found {
-			o.memory.ProcessedEmailURLs = append(o.memory.ProcessedEmailURLs, summary.URL)
-			o.memory.EmailsRead++
-		}
 	}
 
 	// Count scrolls
