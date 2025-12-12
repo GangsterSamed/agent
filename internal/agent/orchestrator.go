@@ -21,24 +21,20 @@ type Task struct {
 }
 
 type Orchestrator struct {
-	cfg       Config
-	planner   Planner
-	tools     tools.Toolbox
-	logger    zerolog.Logger
-	subAgents []SubAgent // Specialized agents for different task types
+	cfg     Config
+	planner Planner
+	tools   tools.Toolbox
+	logger  zerolog.Logger
 	// Error tracking for adaptive handling
 	errorHistory []errorRecord
-	// Persistent memory for email tasks
+	// Persistent memory for tasks
 	memory *TaskMemory
 }
 
 type TaskMemory struct {
-	InInbox       bool
-	ScrollCount   int
-	EmailsSeen    int
-	LastSnapshot  snapshot.Summary
-	LastAction    string
-	EmailElements []snapshot.Element
+	ScrollCount  int
+	LastSnapshot snapshot.Summary
+	LastAction   string
 }
 
 type errorRecord struct {
@@ -48,14 +44,13 @@ type errorRecord struct {
 	timestamp time.Time
 }
 
-func NewOrchestrator(cfg Config, planner Planner, toolbox tools.Toolbox, logger zerolog.Logger, subAgents ...SubAgent) *Orchestrator {
+func NewOrchestrator(cfg Config, planner Planner, toolbox tools.Toolbox, logger zerolog.Logger) *Orchestrator {
 	return &Orchestrator{
-		cfg:       cfg,
-		planner:   planner,
-		tools:     toolbox,
-		logger:    logger,
-		subAgents: subAgents,
-		memory:    &TaskMemory{},
+		cfg:     cfg,
+		planner: planner,
+		tools:   toolbox,
+		logger:  logger,
+		memory:  &TaskMemory{},
 	}
 }
 
@@ -75,26 +70,19 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 		}
 
 		// Re-observation loop: always get fresh snapshot at start of each step
-		// For email tasks, wait for email elements to appear before snapshot
-		if len(o.subAgents) > 0 {
-			for _, subAgent := range o.subAgents {
-				if subAgent.CanHandle(task.Description) {
-					// Wait for email elements to load (for email clients like Yandex Mail)
-					_, err := o.tools.Invoke(ctx, "wait_for_emails", map[string]any{"timeout_ms": 5000})
-					if err != nil {
-						// Ignore error - emails might already be loaded
-						o.logger.Debug().Err(err).Msg("wait_for_emails")
-					}
-					break
-				}
-			}
-		}
+		// No task-specific logic - LLM decides when to wait based on snapshot
 
 		ctxSnap, cancel := snapshot.WithDeadline(ctx, 5*time.Second)
 		summary, _ := snap(ctxSnap)
 		cancel()
 
-		// ALWAYS log snapshot info for debugging (especially for email tasks)
+		// Update toolbox with current snapshot so collect_texts can find real indices
+		o.tools.SetSnapshot(&summary)
+
+		// Note: If storage state was loaded, page starts at about:blank
+		// Cookies from storage state are automatically applied by Playwright when navigating to the domain
+
+		// ALWAYS log snapshot info for debugging
 		elemPreview := ""
 		if len(summary.Elements) > 0 {
 			maxPreview := 10
@@ -129,43 +117,40 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 			Tools:   o.tools.Describe(),
 		}
 
-		// Sub-agent architecture: delegate to specialized agent if available
-		var dec Decision
-		var err error
-		subAgent := o.selectSubAgent(task.Description)
-		if subAgent != nil {
-			o.logger.Info().
-				Str("sub_agent", subAgent.Name()).
-				Str("task", task.Description).
-				Msg("delegating to specialized agent")
-
-			// Non-trivial solution: if EmailAgent and no email rows found, wait for them first
-			// Skip on first step (about:blank) or if already navigated
-			if subAgent.Name() == "EmailAgent" && summary.URL != "about:blank" && summary.URL != "" && o.shouldWaitForEmails(summary) {
-				o.logger.Info().Msg("no email rows found - waiting for emails to appear")
-				_, waitErr := o.tools.Invoke(ctx, "wait_for_emails", map[string]any{"timeout_ms": 10000})
-				if waitErr == nil {
-					// Update snapshot after waiting
-					time.Sleep(500 * time.Millisecond)
-					ctxSnapWait, cancelWait := snapshot.WithDeadline(ctx, 3*time.Second)
-					summaryWait, _ := snap(ctxSnapWait)
-					cancelWait()
-					summary = summaryWait
-					state.Summary = summaryWait
-				}
-			}
-
-			dec, err = subAgent.Next(ctx, state)
-		} else {
-			// Use default planner
-			dec, err = o.planner.Next(ctx, state)
-		}
+		// Use unified planner with dynamic system prompt (browser-use pattern)
+		// No sub-agents needed - planner adapts to task type automatically
+		dec, err := o.planner.Next(ctx, state)
 		if err != nil {
 			return fmt.Errorf("planner: %w", err)
 		}
 
+		// Log reasoning if available (for debugging and transparency)
+		if dec.Thinking != "" {
+			o.logger.Debug().Str("thinking", dec.Thinking).Msg("agent thinking")
+		}
+		if dec.EvaluationPreviousGoal != "" {
+			o.logger.Info().Str("evaluation", dec.EvaluationPreviousGoal).Msg("evaluation")
+		}
+		if dec.Memory != "" {
+			o.logger.Info().Str("memory", dec.Memory).Msg("agent memory")
+		}
+		if dec.NextGoal != "" {
+			o.logger.Info().Str("next_goal", dec.NextGoal).Msg("next goal")
+		}
+
 		if dec.Finish {
-			fmt.Printf("✅ %s\n", dec.Message)
+			if dec.Message != "" {
+				fmt.Printf("✅ %s\n", dec.Message)
+			} else {
+				// Fallback: use thinking or memory if message is empty
+				if dec.Thinking != "" {
+					fmt.Printf("✅ %s\n", dec.Thinking)
+				} else if dec.Memory != "" {
+					fmt.Printf("✅ Task completed. %s\n", dec.Memory)
+				} else {
+					fmt.Printf("✅ Task completed\n")
+				}
+			}
 			return nil
 		}
 
@@ -176,47 +161,33 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 		if dec.ActionName == "click_by_index" {
 			limit = 2 // Strict limit for click_by_index - prevent loops
 		}
-
-		// Prevent clicking on already active folder (e.g., clicking "Спам" when already in Spam folder)
-		if dec.ActionName == "click_by_index" || dec.ActionName == "click_selector" {
-			index, hasIndex := dec.ActionInput["index"]
-			selector, hasSelector := dec.ActionInput["selector"].(string)
-
-			// Check if clicking on Spam folder when already in Spam
-			if strings.Contains(summary.URL, "#spam") || strings.Contains(summary.Title, "Спам") {
-				if hasIndex {
-					// Find element by index
-					var foundElement *snapshot.Element
-					for i := range summary.Elements {
-						if summary.Elements[i].Index == int(index.(float64)) {
-							foundElement = &summary.Elements[i]
-							break
-						}
-					}
-					if foundElement != nil && strings.Contains(strings.ToLower(foundElement.Text), "спам") {
-						o.logger.Warn().
-							Int("index", int(index.(float64))).
-							Msg("preventing click on already active Spam folder")
-						// Skip this action and continue
-						history = append(history, HistoryItem{
-							Action: "observation",
-							Result: "skipped: already in Spam folder, don't click on it again",
-							URL:    summary.URL,
-						})
-						continue
-					}
-				}
-				if hasSelector && (strings.Contains(selector, "Спам") || strings.Contains(strings.ToLower(selector), "spam")) {
-					o.logger.Warn().Str("selector", selector).Msg("preventing click on already active Spam folder")
-					history = append(history, HistoryItem{
-						Action: "observation",
-						Result: "skipped: already in Spam folder, don't click on it again",
-						URL:    summary.URL,
-					})
-					continue
+		if dec.ActionName == "wait_for_lazy_list" {
+			limit = 2 // Limit wait_for_lazy_list to prevent loops when snapshot doesn't change
+		}
+		if dec.ActionName == "navigate" {
+			limit = 2 // Limit navigate to prevent loops - if same URL doesn't work, try different URL
+		}
+		if dec.ActionName == "wait" {
+			limit = 3 // Limit wait to prevent infinite waiting loops
+		}
+		// request_user_input is allowed to repeat - user may need to provide multiple pieces of data (login, password, captcha confirmation, etc.)
+		if dec.ActionName == "request_user_input" {
+			// Skip repeat check for request_user_input - it's normal to ask for multiple inputs
+			limit = 999 // Effectively unlimited
+		}
+		// save_state should only be called once - if it succeeded, task is likely complete
+		if dec.ActionName == "save_state" {
+			// Check if save_state was already successful in history
+			for _, item := range history {
+				if item.Action == "save_state" && strings.Contains(item.Result, "saved") {
+					// Already saved - suggest finishing task instead
+					limit = 1
+					break
 				}
 			}
 		}
+
+		// No hardcoded logic for specific sites - LLM decides what to do
 		// Pass URL context for tooManyRepeats check
 		checkInput := make(map[string]any)
 		for k, v := range dec.ActionInput {
@@ -253,6 +224,50 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 		// Update memory
 		o.updateMemory(dec.ActionName, summary)
 
+		// CRITICAL: Block any click actions on captcha pages
+		url := summary.URL
+		title := summary.Title
+		isCaptchaPage := strings.Contains(url, "captcha") || strings.Contains(url, "showcaptcha") ||
+			strings.Contains(strings.ToLower(title), "робот") || strings.Contains(strings.ToLower(title), "robot")
+
+		if isCaptchaPage && (dec.ActionName == "click_by_index" || dec.ActionName == "click_role" || dec.ActionName == "click_selector" || dec.ActionName == "click_text") {
+			// Check if element text contains captcha-related text
+			isCaptchaElement := false
+			if dec.ActionName == "click_by_index" {
+				if index, ok := dec.ActionInput["index"].(float64); ok {
+					indexInt := int(index)
+					for i := range summary.Elements {
+						if summary.Elements[i].Index == indexInt {
+							elText := strings.ToLower(summary.Elements[i].Text)
+							isCaptchaElement = strings.Contains(elText, "робот") || strings.Contains(elText, "robot") ||
+								strings.Contains(elText, "не робот") || strings.Contains(elText, "not a robot")
+							break
+						}
+					}
+				}
+			} else if name, ok := dec.ActionInput["name"].(string); ok {
+				nameLower := strings.ToLower(name)
+				isCaptchaElement = strings.Contains(nameLower, "робот") || strings.Contains(nameLower, "robot") ||
+					strings.Contains(nameLower, "не робот") || strings.Contains(nameLower, "not a robot")
+			} else if text, ok := dec.ActionInput["text"].(string); ok {
+				textLower := strings.ToLower(text)
+				isCaptchaElement = strings.Contains(textLower, "робот") || strings.Contains(textLower, "robot") ||
+					strings.Contains(textLower, "не робот") || strings.Contains(textLower, "not a robot")
+			}
+
+			if isCaptchaElement || isCaptchaPage {
+				o.logger.Warn().
+					Str("action", dec.ActionName).
+					Str("url", url).
+					Msg("Blocked click action on captcha page - agent must use request_user_input")
+				// Force agent to use request_user_input
+				dec.ActionName = "request_user_input"
+				dec.ActionInput = map[string]any{
+					"message": "Please solve the captcha in the browser and type 'done' when finished",
+				}
+			}
+		}
+
 		// Handle click_by_index: convert to click_selector using element from snapshot (browser-use pattern)
 		var foundElement *snapshot.Element // Keep reference for bbox fallback
 		if dec.ActionName == "click_by_index" {
@@ -284,20 +299,56 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 				return fmt.Errorf("element with index %d not found in current snapshot. Available indices: %v. Use an index from the current snapshot", indexInt, availableIndices)
 			}
 
-			// Browser-use pattern: don't check DOM existence - just try to click
-			// If selector doesn't work, fallback to coordinates from bbox
-			// This handles virtualized lists and iframes better
+			// CRITICAL FIX: For CDP elements without bbox, prefer selector if available
+			// CDP sees virtualized elements but they may not have valid selectors or bbox
+			// If selector exists and looks valid, use click_selector
+			// Otherwise, use click_role with name
+			if foundElement.BBox == "" && foundElement.Role != "" && foundElement.Role != "generic" && foundElement.Role != "none" {
+				// Element has no bbox (virtualized) - try selector first, then click_role
+				// Check if selector looks valid (not empty, not just role)
+				hasValidSelector := foundElement.Sel != "" &&
+					!strings.HasPrefix(foundElement.Sel, "[role=\"") && // Not just [role="link"]
+					strings.Contains(foundElement.Sel, "[") // Has some selector structure
 
-			// Convert to click_selector
-			o.logger.Debug().
-				Int("index", indexInt).
-				Str("selector", foundElement.Sel).
-				Str("text", truncateTextForDebug(foundElement.Text, 30)).
-				Str("bbox", foundElement.BBox).
-				Msg("converting click_by_index to click_selector")
+				if hasValidSelector {
+					// Use selector - it should work even without bbox
+					o.logger.Debug().
+						Int("index", indexInt).
+						Str("selector", foundElement.Sel).
+						Str("text", truncateTextForDebug(foundElement.Text, 30)).
+						Msg("CDP element without bbox - using selector")
 
-			dec.ActionName = "click_selector"
-			dec.ActionInput = map[string]any{"selector": foundElement.Sel}
+					dec.ActionName = "click_selector"
+					dec.ActionInput = map[string]any{"selector": foundElement.Sel}
+				} else {
+					// Use click_role with name - Playwright Locator API handles virtualized lists
+					// Even for email links, Playwright should find the right element
+					o.logger.Debug().
+						Int("index", indexInt).
+						Str("role", foundElement.Role).
+						Str("text", truncateTextForDebug(foundElement.Text, 30)).
+						Msg("CDP element without bbox - using click_role")
+
+					dec.ActionName = "click_role"
+					dec.ActionInput = map[string]any{
+						"role": foundElement.Role,
+					}
+					if foundElement.Text != "" {
+						dec.ActionInput["name"] = foundElement.Text
+					}
+				}
+			} else {
+				// Element has bbox or generic role - use normal selector conversion
+				o.logger.Debug().
+					Int("index", indexInt).
+					Str("selector", foundElement.Sel).
+					Str("text", truncateTextForDebug(foundElement.Text, 30)).
+					Str("bbox", foundElement.BBox).
+					Msg("converting click_by_index to click_selector")
+
+				dec.ActionName = "click_selector"
+				dec.ActionInput = map[string]any{"selector": foundElement.Sel}
+			}
 		}
 
 		result, err := o.tools.Invoke(ctx, dec.ActionName, dec.ActionInput)
@@ -381,6 +432,35 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 				freshSummary, _ := snap(ctxSnapRetry)
 				cancelRetry()
 
+				// CRITICAL: Check if page state changed (user completed action manually)
+				// If URL changed significantly or new elements appeared, user likely completed the action
+				urlChanged := summary.URL != freshSummary.URL
+				elementsChanged := len(freshSummary.Elements) != len(summary.Elements)
+
+				// If timeout occurred but page state changed, assume user completed the action
+				// This is especially important for fill_by_index - user may have filled field manually
+				if errorType == "timeout" && (urlChanged || elementsChanged) {
+					o.logger.Info().
+						Bool("url_changed", urlChanged).
+						Bool("elements_changed", elementsChanged).
+						Str("old_url", summary.URL).
+						Str("new_url", freshSummary.URL).
+						Int("old_elements", len(summary.Elements)).
+						Int("new_elements", len(freshSummary.Elements)).
+						Str("action", dec.ActionName).
+						Msg("Page state changed after timeout - assuming user completed action manually")
+
+					// Record success with note that user completed it
+					item := HistoryItem{
+						Action: dec.ActionName,
+						Result: fmt.Sprintf("timeout but page changed - user likely completed action manually (URL changed: %v, elements changed: %v)", urlChanged, elementsChanged),
+						URL:    freshSummary.URL,
+					}
+					history = append(history, item)
+					summary = freshSummary
+					continue // Continue with new state
+				}
+
 				// Adaptive error handling: try multiple strategies with fresh snapshot
 				recoveredAction, recoveredResult, success := o.handleErrorAdaptively(ctx, dec, freshSummary, snap, history, step)
 				if success {
@@ -435,15 +515,70 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 			}
 		}
 		fmt.Printf("agent[%d]: %s -> %s\n", step, dec.ActionName, truncate(dec.ActionName, result.Observation))
-		// Create history item with selector and URL context
+
+		// CRITICAL: After request_user_input with "done", check if page changed
+		// If page changed (URL or elements), user completed the action - don't ask again
+		if dec.ActionName == "request_user_input" && strings.Contains(result.Observation, "User confirmed: action completed") {
+			oldURL := summary.URL
+			oldElementCount := len(summary.Elements)
+
+			// Wait a bit for page to settle after user action
+			time.Sleep(1 * time.Second)
+			ctxSnapAfter, cancelAfter := snapshot.WithDeadline(ctx, 3*time.Second)
+			freshSummaryAfter, _ := snap(ctxSnapAfter)
+			cancelAfter()
+
+			urlChanged := oldURL != freshSummaryAfter.URL
+			elementsChanged := oldElementCount != len(freshSummaryAfter.Elements)
+
+			if urlChanged || elementsChanged {
+				o.logger.Info().
+					Bool("url_changed", urlChanged).
+					Bool("elements_changed", elementsChanged).
+					Str("old_url", oldURL).
+					Str("new_url", freshSummaryAfter.URL).
+					Int("old_elements", oldElementCount).
+					Int("new_elements", len(freshSummaryAfter.Elements)).
+					Msg("Page changed after user confirmation - user completed action, continuing with new state")
+
+				// Update summary to reflect new state and record success
+				item := HistoryItem{
+					Action: dec.ActionName,
+					Result: fmt.Sprintf("User confirmed action and page changed (URL changed: %v, elements changed: %v) - continuing with new state", urlChanged, elementsChanged),
+					URL:    freshSummaryAfter.URL,
+				}
+				history = append(history, item)
+				summary = freshSummaryAfter
+				continue // Skip to next iteration with new state
+			}
+		}
+
+		// Create history item with selector, URL context, and reasoning fields (like browser-use-reference)
 		item := HistoryItem{
-			Action: dec.ActionName,
-			Result: result.Observation,
-			URL:    summary.URL,
+			Action:                 dec.ActionName,
+			Result:                 result.Observation,
+			URL:                    summary.URL,
+			EvaluationPreviousGoal: dec.EvaluationPreviousGoal,
+			Memory:                 dec.Memory,
+			NextGoal:               dec.NextGoal,
 		}
 		if dec.ActionName == "click_selector" {
 			if sel, ok := dec.ActionInput["selector"].(string); ok {
 				item.Selector = sel
+			}
+		}
+		// Enhance history to show data flow without hardcoded hints
+		// For request_user_input: preserve the actual data value in result so agent can see what was received
+		// For fill_by_index: include the text that was filled so agent can match it with previous request_user_input results
+		// This helps agent track data flow: request -> receive -> use, without hardcoded instructions
+		if dec.ActionName == "request_user_input" && !strings.Contains(result.Observation, "User confirmed:") {
+			// This is data (not confirmation) - make it clear in history
+			item.Result = fmt.Sprintf("Received data from user: %s", result.Observation)
+		}
+		if dec.ActionName == "fill_by_index" {
+			if text, ok := dec.ActionInput["text"].(string); ok && text != "" {
+				// Include the filled text in result so agent can see what data was used
+				item.Result = fmt.Sprintf("%s (text: %s)", result.Observation, text)
 			}
 		}
 		history = append(history, item)
@@ -459,7 +594,7 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 				o.logger.Info().Msg("snapshot unchanged after scroll - stopping scroll loop")
 				history = append(history, HistoryItem{
 					Action: "observation",
-					Result: "no changes after scroll - emails may be in iframe, use collect_texts or read_page",
+					Result: "no changes after scroll - content may be in iframe, use collect_texts or read_page",
 				})
 				// Update summary to reflect that scroll didn't help
 				summary = stableSummary
@@ -468,7 +603,13 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 			}
 		} else {
 			// Re-observation loop: update snapshot after every action
-			time.Sleep(800 * time.Millisecond) // Wait for DOM to update after action
+			// For fill actions, wait longer to allow form validation and UI updates
+			// Forms may need time to validate input and update UI (enable buttons, show errors, etc.)
+			waitTime := 800 * time.Millisecond
+			if dec.ActionName == "fill_by_index" || dec.ActionName == "fill" {
+				waitTime = 3000 * time.Millisecond // Wait 3 seconds for form fields - gives pages time to update UI after input
+			}
+			time.Sleep(waitTime)
 			ctxSnapAfter, cancelAfter := snapshot.WithDeadline(ctx, 3*time.Second)
 			summaryAfter, _ := snap(ctxSnapAfter)
 			cancelAfter()
@@ -478,6 +619,8 @@ func (o *Orchestrator) Run(ctx context.Context, task Task, snap summaryFunc) err
 
 		// Update memory after action
 		o.updateMemory(dec.ActionName, summary)
+
+		// No hardcoded auto-actions for specific URL patterns - LLM decides when to read content
 
 		// Delay after click actions to let heavy SPAs update
 		if dec.ActionName == "click_role" || dec.ActionName == "click_selector" || dec.ActionName == "click_text" {
@@ -597,12 +740,11 @@ func requiresConfirmation(action string, input map[string]any) bool {
 
 	// Keywords that indicate destructive actions (case-insensitive)
 	destructiveKeywords := []string{
-		"delete", "удалить", "удалить письмо", "удалить сообщение",
+		"delete", "удалить",
 		"payment", "оплатить", "купить", "buy", "purchase", "checkout", "pay",
 		"remove", "очистить", "clear",
 		"submit", "отправить", "подтвердить",
 		"confirm", "подтвердить",
-		"spam", "спам",
 		"cancel", "отменить",
 		"archive", "архив",
 		"unsubscribe", "отписаться",
@@ -1011,16 +1153,6 @@ func (o *Orchestrator) extractTextFromSelector(dec Decision, summary snapshot.Su
 	return ""
 }
 
-// selectSubAgent chooses the appropriate specialized agent for the task
-func (o *Orchestrator) selectSubAgent(task string) SubAgent {
-	for _, agent := range o.subAgents {
-		if agent.CanHandle(task) {
-			return agent
-		}
-	}
-	return nil // No specialized agent found, use default planner
-}
-
 // updateMemory updates persistent memory about task progress
 func (o *Orchestrator) updateMemory(action string, summary snapshot.Summary) {
 	if o.memory == nil {
@@ -1029,61 +1161,12 @@ func (o *Orchestrator) updateMemory(action string, summary snapshot.Summary) {
 	o.memory.LastAction = action
 	o.memory.LastSnapshot = summary
 
-	// Check if we're in inbox
-	urlLower := strings.ToLower(summary.URL)
-	titleLower := strings.ToLower(summary.Title)
-	if strings.Contains(urlLower, "inbox") || strings.Contains(urlLower, "входящие") ||
-		strings.Contains(titleLower, "входящие") || strings.Contains(titleLower, "inbox") {
-		o.memory.InInbox = true
-	}
+	// No hardcoded site-specific memory tracking - LLM tracks context from snapshot
 
 	// Count scrolls
 	if action == "scroll_page" {
 		o.memory.ScrollCount++
 	}
-}
-
-// shouldWaitForEmails checks if we should wait for email elements
-func (o *Orchestrator) shouldWaitForEmails(summary snapshot.Summary) bool {
-	// Don't wait on empty/blank pages
-	if summary.URL == "" || summary.URL == "about:blank" {
-		return false
-	}
-
-	// Check if we're on an email page
-	urlLower := strings.ToLower(summary.URL)
-	titleLower := strings.ToLower(summary.Title)
-	if !strings.Contains(urlLower, "mail") && !strings.Contains(titleLower, "почт") && !strings.Contains(titleLower, "mail") {
-		return false
-	}
-
-	// Check if we have email-like elements
-	emailIndicators := []string{"@", "от:", "from:", "тема", "subject", "письм", "message"}
-	hasEmailElements := false
-	for _, el := range summary.Elements {
-		textLower := strings.ToLower(el.Text)
-		attrLower := strings.ToLower(el.Attr)
-		for _, indicator := range emailIndicators {
-			if strings.Contains(textLower, indicator) || strings.Contains(attrLower, indicator) {
-				hasEmailElements = true
-				break
-			}
-		}
-		// Check for email-specific attributes
-		if strings.Contains(attrLower, "data-testid") &&
-			(strings.Contains(attrLower, "message") || strings.Contains(attrLower, "mail")) {
-			hasEmailElements = true
-			break
-		}
-	}
-
-	// If we have email elements, don't wait
-	if hasEmailElements {
-		return false
-	}
-
-	// No email indicators found - should wait
-	return true
 }
 
 // snapshotChanged compares two snapshots to see if DOM changed significantly
@@ -1095,7 +1178,7 @@ func (o *Orchestrator) snapshotChanged(old, new snapshot.Summary) bool {
 	if len(old.Elements) != len(new.Elements) {
 		return true
 	}
-	// Check if we have new email-like elements
+	// Check if we have new elements
 	if len(new.Elements) > len(old.Elements) {
 		// More elements = likely new content loaded
 		return true

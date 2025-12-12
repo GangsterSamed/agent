@@ -22,6 +22,7 @@ const (
 type Controller interface {
 	Close(ctx context.Context) error
 	Navigate(ctx context.Context, url string) error
+	GoBack(ctx context.Context) error
 	ClickText(ctx context.Context, text string, exact bool) error
 	ClickRole(ctx context.Context, role, name string, exact bool) error
 	Click(ctx context.Context, selector string) error
@@ -32,10 +33,10 @@ type Controller interface {
 	Scroll(ctx context.Context, direction string, distance int) (int, error)
 	ScrollToElement(ctx context.Context, selector string) error
 	WaitFor(ctx context.Context, selector string, timeout time.Duration) error
-	WaitForEmailElements(ctx context.Context, timeout time.Duration) error
+	WaitForLazyListItems(ctx context.Context, timeout time.Duration) error
 	WaitForStableDOM(ctx context.Context, timeout time.Duration) error
 	SaveState(ctx context.Context, path string) error
-	Hover(ctx context.Context, selector string) error // Hover over element (for Twitter-like sites where elements appear on hover)
+	Hover(ctx context.Context, selector string) error // Hover over element to reveal hidden elements
 	Page() playwright.Page
 }
 
@@ -73,8 +74,13 @@ func (l *Launcher) NewController(ctx context.Context, storagePath string) (Contr
 	opts := playwright.BrowserNewContextOptions{
 		IgnoreHttpsErrors: playwright.Bool(true),
 	}
+	hasStorageState := false
 	if strings.TrimSpace(storagePath) != "" {
-		opts.StorageStatePath = playwright.String(storagePath)
+		// Check if storage state file exists
+		if _, err := os.Stat(storagePath); err == nil {
+			opts.StorageStatePath = playwright.String(storagePath)
+			hasStorageState = true
+		}
 	}
 	context, err := l.browser.NewContext(opts)
 	if err != nil {
@@ -86,7 +92,11 @@ func (l *Launcher) NewController(ctx context.Context, storagePath string) (Contr
 		return nil, fmt.Errorf("new page: %w", err)
 	}
 	page.SetDefaultTimeout(float64(defaultNavTimeout.Milliseconds()))
-	return &controller{context: context, page: page}, nil
+
+	// If storage state was loaded, page might be on about:blank
+	// This is normal - agent will navigate to the site and cookies will be applied
+	ctrl := &controller{context: context, page: page, hasStorageState: hasStorageState}
+	return ctrl, nil
 }
 
 func (l *Launcher) Close() error {
@@ -100,8 +110,9 @@ func (l *Launcher) Close() error {
 }
 
 type controller struct {
-	context playwright.BrowserContext
-	page    playwright.Page
+	context         playwright.BrowserContext
+	page            playwright.Page
+	hasStorageState bool // Track if storage state was loaded
 }
 
 func (c *controller) Page() playwright.Page {
@@ -123,10 +134,20 @@ func (c *controller) Navigate(ctx context.Context, url string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// When navigating with storage state, cookies from storage state are automatically applied
+	// by Playwright when navigating to the domain
 	_, err := c.page.Goto(url, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateLoad,
 		Timeout:   playwright.Float(float64(defaultNavTimeout.Milliseconds())),
 	})
+	return wrap(err)
+}
+
+func (c *controller) GoBack(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_, err := c.page.GoBack()
 	return wrap(err)
 }
 
@@ -154,7 +175,11 @@ func (c *controller) ClickRole(ctx context.Context, role, name string, exact boo
 		Exact: playwright.Bool(exact),
 	})
 	first := loc.First()
-	if err := first.WaitFor(playwright.LocatorWaitForOptions{State: playwright.WaitForSelectorStateVisible}); err != nil {
+	// Use 15s timeout - balance between reliability and speed
+	if err := first.WaitFor(playwright.LocatorWaitForOptions{
+		State:   playwright.WaitForSelectorStateVisible,
+		Timeout: playwright.Float(15000), // 15s timeout
+	}); err != nil {
 		return wrap(err)
 	}
 	return wrap(first.Click())
@@ -198,8 +223,7 @@ func (c *controller) ClickByTextFuzzy(ctx context.Context, text string) error {
 	})
 	first := loc.First()
 	if err := first.WaitFor(playwright.LocatorWaitForOptions{
-		State:   playwright.WaitForSelectorStateVisible,
-		Timeout: playwright.Float(5000), // Shorter timeout for fuzzy
+		State: playwright.WaitForSelectorStateVisible,
 	}); err != nil {
 		return wrap(err)
 	}
@@ -219,7 +243,7 @@ func (c *controller) ScrollToElement(ctx context.Context, selector string) error
 	return wrap(first.ScrollIntoViewIfNeeded())
 }
 
-// Hover hovers over element (useful for Twitter-like sites where elements appear only on hover)
+// Hover hovers over element to reveal hidden elements (useful for dynamic content)
 func (c *controller) Hover(ctx context.Context, selector string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -232,8 +256,8 @@ func (c *controller) Hover(ctx context.Context, selector string) error {
 	return wrap(first.Hover())
 }
 
-// WaitForEmailElements waits for email-like elements to appear (non-trivial solution)
-func (c *controller) WaitForEmailElements(ctx context.Context, timeout time.Duration) error {
+// WaitForLazyListItems waits for lazy-loaded list items to appear (universal solution)
+func (c *controller) WaitForLazyListItems(ctx context.Context, timeout time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -241,13 +265,13 @@ func (c *controller) WaitForEmailElements(ctx context.Context, timeout time.Dura
 		timeout = 10 * time.Second
 	}
 
-	// Wait for common email patterns
+	// Wait for common list item patterns (universal, not site-specific)
 	patterns := []string{
-		"[data-testid*='message']",
-		"[data-testid*='mail']",
-		"[data-testid*='item'][role='row']",
-		"[role='row'][aria-label*='@']",
-		"[data-uid]", // Yandex Mail specific
+		"[role='row']",
+		"[role='listitem']",
+		"[role='option']",
+		"li[data-*]",
+		"div[data-*][role]",
 	}
 
 	deadline := time.Now().Add(timeout)
@@ -261,7 +285,7 @@ func (c *controller) WaitForEmailElements(ctx context.Context, timeout time.Dura
 			State:   playwright.WaitForSelectorStateVisible,
 			Timeout: playwright.Float(timeout.Seconds() * 1000 / float64(len(patterns))),
 		}); err == nil {
-			// Found at least one email element
+			// Found at least one list item
 			return nil
 		}
 	}
@@ -284,16 +308,15 @@ func (c *controller) WaitForEmailElements(ctx context.Context, timeout time.Dura
 		}
 	}
 
-	// Fallback: search by text content for email indicators (ChatGPT recommendation)
-	// This helps when selectors don't match but email content is present
+	// Fallback: search by text content for list-like structures
 	fallbackScript := `(limit) => {
 		const out = [];
 		function scan(root) {
-			const nodes = root.querySelectorAll("div, li, span, a, [role='option'], [role='listitem']");
+			const nodes = root.querySelectorAll("div, li, span, a, [role='option'], [role='listitem'], [role='row']");
 			for (const n of nodes) {
 				try {
 					const t = (n.innerText || n.textContent || "").trim();
-					if (t && (t.includes("@") || /тема|subject|от:|from:|письмо|email/i.test(t))) {
+					if (t && t.length > 10 && t.length < 500) {
 						out.push(t.slice(0,200));
 						if (out.length >= limit) return;
 					}
@@ -315,12 +338,12 @@ func (c *controller) WaitForEmailElements(ctx context.Context, timeout time.Dura
 	val, err := c.page.Evaluate(fallbackScript, 3)
 	if err == nil {
 		if arr, ok := val.([]interface{}); ok && len(arr) > 0 {
-			// Found email-like content by text
+			// Found list-like content
 			return nil
 		}
 	}
 
-	return fmt.Errorf("no email elements found after %v", timeout)
+	return fmt.Errorf("no list items found after %v", timeout)
 }
 
 func (c *controller) Fill(ctx context.Context, selector, text string) error {
@@ -425,7 +448,7 @@ func (c *controller) Scroll(ctx context.Context, direction string, distance int)
 
 	// Improved scroll: find scrollable container (ChatGPT recommendation)
 	// Prefer focused element's ancestor, then common containers
-	// This is critical for email clients and other SPAs that use internal scroll containers
+	// This is critical for SPAs that use internal scroll containers
 	script := `(dir, dist) => {
 		function isScrollable(el) {
 			if (!el) return false;
