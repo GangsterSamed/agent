@@ -70,16 +70,13 @@ func main() {
 	toolbox := tools.New(ctrl, terminalPrompt())
 	planner := agent.NewPlanner(llmClient)
 
-	// Create specialized sub-agents
-	emailAgent := agent.NewEmailAgent(llmClient)
-
-	// Create orchestrator with sub-agents
+	// Create orchestrator with unified planner (no sub-agents needed)
+	// Planner adapts to task type automatically via dynamic system prompt
 	orch := agent.NewOrchestrator(
 		agent.Config{MaxSteps: opts.maxSteps},
 		planner,
 		toolbox,
 		log.With().Str("comp", "orch").Logger(),
-		emailAgent, // Register EmailAgent
 	)
 
 	fmt.Println("Начинаю задачу...")

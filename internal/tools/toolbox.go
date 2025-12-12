@@ -9,13 +9,15 @@ import (
 
 	"github.com/playwright-community/playwright-go"
 	"github.com/polzovatel/ai-agent-for-browser-fast/internal/browser"
+	"github.com/polzovatel/ai-agent-for-browser-fast/internal/snapshot"
 )
 
 type Toolbox interface {
 	Describe() []Tool
 	Invoke(ctx context.Context, name string, input map[string]any) (Result, error)
 	WaitForStableDOM(ctx context.Context, timeout time.Duration) error
-	Page() playwright.Page // For checking element existence
+	Page() playwright.Page                 // For checking element existence
+	SetSnapshot(summary *snapshot.Summary) // Set current snapshot for collect_texts to find real indices
 }
 
 type Tool struct {
@@ -31,32 +33,37 @@ type Result struct {
 type PromptFunc func(ctx context.Context, message string) (string, error)
 
 type standard struct {
-	ctrl   browser.Controller
-	prompt PromptFunc
-	tools  []Tool
+	ctrl        browser.Controller
+	prompt      PromptFunc
+	tools       []Tool
+	curSnapshot *snapshot.Summary // Current snapshot for finding real indices
 }
 
 func New(ctrl browser.Controller, prompt PromptFunc) Toolbox {
 	return &standard{
-		ctrl:   ctrl,
-		prompt: prompt,
+		ctrl:        ctrl,
+		prompt:      prompt,
+		curSnapshot: nil,
 		tools: []Tool{
 			newTool("navigate", "Open URL", schema{"url": str("url to open")}, []string{"url"}),
+			newTool("go_back", "Navigate back in browser history (use when you need to return to previous page)", schema{}, nil),
 			newTool("click_by_index", "Click element by index from snapshot (PREFERRED - use index from elements list, e.g. [1], [2], [3])", schema{"index": integer("element index from snapshot (1-based)")}, []string{"index"}),
 			newTool("click_text", "Click element by visible text", schema{"text": str("text to click"), "exact": boolean("exact match")}, []string{"text"}),
 			newTool("click_role", "Click element by role (button/link/checkbox/radio/option) and name", schema{"role": str("aria role"), "name": str("visible label"), "exact": boolean("exact name match")}, []string{"role"}),
 			newTool("click_selector", "Click element by CSS selector (fallback when index not available)", schema{"selector": str("CSS selector")}, []string{"selector"}),
 			newTool("click_text_fuzzy", "Click element by partial text match (fallback when exact match fails)", schema{"text": str("partial text to match")}, []string{"text"}),
 			newTool("click_coordinates", "Click at specific coordinates from element bbox (last resort fallback)", schema{"x": integer("x coordinate"), "y": integer("y coordinate")}, []string{"x", "y"}),
-			newTool("fill", "Fill input by CSS selector", schema{"selector": str("CSS selector"), "text": str("text to type")}, []string{"selector", "text"}),
+			newTool("fill_by_index", "Fill input by index from snapshot (PREFERRED - use index from elements list, e.g. [1], [2], [3])", schema{"index": integer("element index from snapshot (1-based)"), "text": str("text to type")}, []string{"index", "text"}),
+			newTool("fill", "Fill input by CSS selector (fallback when index not available)", schema{"selector": str("CSS selector"), "text": str("text to type")}, []string{"selector", "text"}),
 			newTool("scroll_page", "Scroll page up/down/top/bottom. Distance is optional - if not provided, uses viewport height (~600-1000px). Use sparingly, max 1-2 times.", schema{"direction": str("down|up|top|bottom|page_down|page_up"), "distance": integer("pixels, optional (defaults to viewport height if not provided)")}, nil),
 			newTool("scroll_to_element", "Scroll element into view before clicking", schema{"selector": str("CSS selector")}, []string{"selector"}),
 			newTool("wait_for", "Wait for selector visible", schema{"selector": str("CSS selector"), "timeout_ms": integer("timeout ms")}, []string{"selector"}),
-			newTool("wait_for_emails", "Wait for email elements to appear (for email clients)", schema{"timeout_ms": integer("timeout ms")}, nil),
-			newTool("wait_for_lazy_content", "Wait for lazy-loaded content to appear after scroll (for YouTube, Medium, Twitter)", schema{"selector": str("CSS selector to wait for"), "timeout_ms": integer("timeout ms")}, []string{"selector"}),
+			newTool("wait_for_lazy_list", "Wait for lazy-loaded list items to appear (for dynamic content like messages, posts, items)", schema{"timeout_ms": integer("timeout ms")}, nil),
+			newTool("wait_for_lazy_content", "Wait for lazy-loaded content to appear after scroll", schema{"selector": str("CSS selector to wait for"), "timeout_ms": integer("timeout ms")}, []string{"selector"}),
 			newTool("read_page", "Read text from page or element by selector (use when snapshot doesn't show target elements, especially for iframe content)", schema{"selector": str("CSS selector (empty for full page)"), "max_chars": integer("max characters to return")}, nil),
 			newTool("collect_texts", "Collect texts AND selectors from elements by selector (use when snapshot doesn't show target elements, especially for iframe content). Returns both text and selector for each element so you can click them.", schema{"selector": str("CSS selector"), "attribute": str("attribute name instead of text"), "limit": integer("max elements to collect")}, []string{"selector"}),
-			newTool("request_user_input", "Ask user for extra info (codes, confirm)", schema{"prompt": str("question to user")}, []string{"prompt"}),
+			newTool("request_user_input", "Ask user for data needed to fill form fields (login, password, email, etc.). After receiving the data, use fill_by_index or fill to enter it into the field. The response will be formatted as 'User provided: <value> (use this value in your next action)' - extract the value and use it in fill_by_index or fill.", schema{"prompt": str("question to user (e.g., 'Please provide your login/email', 'Please provide your password')")}, []string{"prompt"}),
+			newTool("wait", "Wait for specified number of seconds. Use when waiting for page to load, user to complete action (like login), or for dynamic content to appear. Maximum 30 seconds per call.", schema{"seconds": integer("seconds to wait (1-30)")}, []string{"seconds"}),
 			newTool("save_state", "Save current storage state", schema{"path": str("path to save")}, []string{"path"}),
 		},
 	}
@@ -78,6 +85,12 @@ func (s *standard) Invoke(ctx context.Context, name string, input map[string]any
 		}
 		return Result{Observation: fmt.Sprintf("opened %s", url)}, nil
 
+	case "go_back":
+		if err := s.ctrl.GoBack(ctx); err != nil {
+			return Result{}, err
+		}
+		return Result{Observation: "navigated back in browser history"}, nil
+
 	case "click_text":
 		text, err := requiredString(input, "text")
 		if err != nil {
@@ -95,7 +108,12 @@ func (s *standard) Invoke(ctx context.Context, name string, input map[string]any
 			return Result{}, err
 		}
 		name := optionalString(input, "name")
-		exact := optionalBool(input, "exact")
+		// CRITICAL: Default to exact match (true) to avoid clicking wrong elements
+		// Only use fuzzy match (false) if explicitly requested
+		exact := true // Default to exact match
+		if _, ok := input["exact"]; ok {
+			exact = optionalBool(input, "exact")
+		}
 		if err := s.ctrl.ClickRole(ctx, role, name, exact); err != nil {
 			return Result{}, err
 		}
@@ -121,7 +139,7 @@ func (s *standard) Invoke(ctx context.Context, name string, input map[string]any
 		if err := s.ctrl.ScrollToElement(ctx, sel); err != nil {
 			// If scroll fails, try click anyway
 		}
-		// For Twitter-like sites: hover before click to reveal hidden elements
+		// Hover before click to reveal hidden elements (useful for dynamic content)
 		// Try hover first, but don't fail if it doesn't work
 		_ = s.ctrl.Hover(ctx, sel)
 		time.Sleep(200 * time.Millisecond) // Brief pause for hover effects
@@ -164,18 +182,18 @@ func (s *standard) Invoke(ctx context.Context, name string, input map[string]any
 		}
 		return Result{Observation: fmt.Sprintf("scrolled to element %s", sel)}, nil
 
-	case "wait_for_emails":
+	case "wait_for_lazy_list":
 		timeout := optionalInt(input, "timeout_ms")
 		if timeout <= 0 {
 			timeout = 10000
 		}
-		if err := s.ctrl.WaitForEmailElements(ctx, time.Duration(timeout)*time.Millisecond); err != nil {
+		if err := s.ctrl.WaitForLazyListItems(ctx, time.Duration(timeout)*time.Millisecond); err != nil {
 			return Result{}, err
 		}
-		return Result{Observation: "email elements appeared"}, nil
+		return Result{Observation: "list items appeared"}, nil
 
 	case "wait_for_lazy_content":
-		// Wait for lazy-loaded content (YouTube, Medium, Twitter pattern)
+		// Wait for lazy-loaded content after scroll
 		// After scroll, content may load asynchronously
 		selector, err := requiredString(input, "selector")
 		if err != nil {
@@ -207,7 +225,7 @@ func (s *standard) Invoke(ctx context.Context, name string, input map[string]any
 		}
 
 		// Improved: read from all frames (ChatGPT recommendation)
-		// This is critical for iframe content like Yandex Mail
+		// This is critical for iframe content in SPAs
 		page := s.ctrl.Page()
 		frames := page.Frames()
 		for _, frame := range frames {
@@ -331,8 +349,35 @@ func (s *standard) Invoke(ctx context.Context, name string, input map[string]any
 							selStr = fmt.Sprintf("%s:nth-of-type(%d)", selector, i+1)
 						}
 					}
-					// Assign index (1-based, like browser-use)
-					itemIndex := len(items) + 1
+					// Find element in snapshot by selector or text to get real index
+					itemIndex := 0
+					if s.curSnapshot != nil {
+						// Try to find element in snapshot by selector or text
+						for _, el := range s.curSnapshot.Elements {
+							// Match by selector (exact or contains)
+							if el.Sel == selStr || strings.Contains(el.Sel, selStr) || strings.Contains(selStr, el.Sel) {
+								itemIndex = el.Index
+								break
+							}
+							// Match by text (first 50 chars for comparison)
+							textPreview := text
+							if len(textPreview) > 50 {
+								textPreview = textPreview[:50]
+							}
+							elTextPreview := el.Text
+							if len(elTextPreview) > 50 {
+								elTextPreview = elTextPreview[:50]
+							}
+							if strings.Contains(elTextPreview, textPreview) || strings.Contains(textPreview, elTextPreview) {
+								itemIndex = el.Index
+								break
+							}
+						}
+					}
+					// If not found in snapshot, use sequential index (fallback)
+					if itemIndex == 0 {
+						itemIndex = len(items) + 1
+					}
 					items = append(items, itemData{
 						Text:     text,
 						Selector: selStr,
@@ -394,8 +439,35 @@ func (s *standard) Invoke(ctx context.Context, name string, input map[string]any
 								selStr = fmt.Sprintf("%s:nth-of-type(%d)", selector, i+1)
 							}
 						}
-						// Assign index (1-based, like browser-use)
-						itemIndex := len(items) + 1
+						// Find element in snapshot by selector or text to get real index
+						itemIndex := 0
+						if s.curSnapshot != nil {
+							// Try to find element in snapshot by selector or text
+							for _, el := range s.curSnapshot.Elements {
+								// Match by selector (exact or contains)
+								if el.Sel == selStr || strings.Contains(el.Sel, selStr) || strings.Contains(selStr, el.Sel) {
+									itemIndex = el.Index
+									break
+								}
+								// Match by text (first 50 chars for comparison)
+								textPreview := text
+								if len(textPreview) > 50 {
+									textPreview = textPreview[:50]
+								}
+								elTextPreview := el.Text
+								if len(elTextPreview) > 50 {
+									elTextPreview = elTextPreview[:50]
+								}
+								if strings.Contains(elTextPreview, textPreview) || strings.Contains(textPreview, elTextPreview) {
+									itemIndex = el.Index
+									break
+								}
+							}
+						}
+						// If not found in snapshot, use sequential index (fallback)
+						if itemIndex == 0 {
+							itemIndex = len(items) + 1
+						}
 						items = append(items, itemData{
 							Text:     text,
 							Selector: selStr,
@@ -410,11 +482,11 @@ func (s *standard) Invoke(ctx context.Context, name string, input map[string]any
 		var responseBuilder strings.Builder
 
 		if len(items) == 0 {
-			responseBuilder.WriteString("❌ No items found with selector. Try different selector like [data-testid*='message'] or [role='option']\n")
+			responseBuilder.WriteString("❌ No items found with selector. Try different selector or check if content is in iframe.\n")
 			return Result{Observation: responseBuilder.String()}, nil
 		}
 
-		responseBuilder.WriteString(fmt.Sprintf("✅ Found %d email items. ", len(items)))
+		responseBuilder.WriteString(fmt.Sprintf("✅ Found %d items. ", len(items)))
 		responseBuilder.WriteString("🚨 CRITICAL: Each item has an 'index' field - USE click_by_index!\n\n")
 		responseBuilder.WriteString("❌ DO NOT use click_selector or generate your own selector!\n")
 		responseBuilder.WriteString("✅ DO use click_by_index with the 'index' field from items[] below (e.g., click_by_index with index=1)!\n\n")
@@ -442,10 +514,10 @@ func (s *standard) Invoke(ctx context.Context, name string, input map[string]any
 			responseBuilder.WriteString(fmt.Sprintf("[%d] text=\"%s\" → USE click_by_index with index=%d\n", item.Index, textPreview, item.Index))
 		}
 		if len(items) > maxShow {
-			responseBuilder.WriteString(fmt.Sprintf("... and %d more emails (all have selectors in JSON)\n", len(items)-maxShow))
+			responseBuilder.WriteString(fmt.Sprintf("... and %d more items (all have selectors in JSON)\n", len(items)-maxShow))
 		}
 
-		responseBuilder.WriteString("\n📋 ACTION REQUIRED: Use click_by_index with index from items[0].index to open first email!\n")
+		responseBuilder.WriteString("\n📋 ACTION REQUIRED: Use click_by_index with index from items[0].index to open first item!\n")
 		if len(items) > 0 {
 			responseBuilder.WriteString(fmt.Sprintf("Example: click_by_index with index=%d\n\n", items[0].Index))
 		}
@@ -468,6 +540,141 @@ func (s *standard) Invoke(ctx context.Context, name string, input map[string]any
 		responseBuilder.WriteString("Full JSON: " + string(encoded))
 
 		return Result{Observation: responseBuilder.String()}, nil
+
+	case "fill_by_index":
+		index, ok := input["index"].(float64)
+		if !ok {
+			indexInt, okInt := input["index"].(int)
+			if okInt {
+				index = float64(indexInt)
+			} else {
+				return Result{}, fmt.Errorf("invalid index type for fill_by_index")
+			}
+		}
+		indexInt := int(index)
+		text, err := requiredString(input, "text")
+		if err != nil {
+			return Result{}, err
+		}
+		// Validate that text is not a placeholder value
+		textLower := strings.ToLower(strings.TrimSpace(text))
+		placeholderPatterns := []string{
+			// English placeholders
+			"your_password", "your_password_here", "password_here", "enter_password",
+			"your_login", "your_email", "enter_email", "enter_login",
+			"placeholder", "example", "sample", "test", "demo",
+			"your_", "enter_", "type_", "input_",
+			// Russian placeholders
+			"ваш_пароль", "ваш_логин", "ваш_email", "ваш_email_здесь",
+			"введите_пароль", "введите_логин", "введите_email",
+			"пароль_здесь", "логин_здесь", "email_здесь",
+			"ваш ", "введите ", "введите_", "введите", "ввод",
+		}
+		for _, pattern := range placeholderPatterns {
+			if strings.Contains(textLower, pattern) {
+				return Result{}, fmt.Errorf("cannot fill field with placeholder value '%s'. You MUST use request_user_input FIRST to get the actual value from the user, then use that value in fill_by_index", text)
+			}
+		}
+		// Find element by index in snapshot and use its selector
+		if s.curSnapshot == nil {
+			return Result{}, fmt.Errorf("snapshot not available - cannot fill by index")
+		}
+		var foundElement *snapshot.Element
+		for i := range s.curSnapshot.Elements {
+			if s.curSnapshot.Elements[i].Index == indexInt {
+				foundElement = &s.curSnapshot.Elements[i]
+				break
+			}
+		}
+		if foundElement == nil {
+			availableIndices := make([]int, 0, len(s.curSnapshot.Elements))
+			for _, el := range s.curSnapshot.Elements {
+				availableIndices = append(availableIndices, el.Index)
+			}
+			return Result{}, fmt.Errorf("element with index %d not found in current snapshot. Available indices: %v", indexInt, availableIndices)
+		}
+		// Use selector from element, or fallback to role-based selector
+		sel := foundElement.Sel
+		if sel == "" && foundElement.Role != "" {
+			// Fallback: try role-based selector
+			if foundElement.Text != "" {
+				textLen := len(foundElement.Text)
+				if textLen > 30 {
+					textLen = 30
+				}
+				sel = fmt.Sprintf(`[role="%s"][aria-label*="%s"]`, foundElement.Role, foundElement.Text[:textLen])
+			} else {
+				sel = fmt.Sprintf(`[role="%s"]`, foundElement.Role)
+			}
+		}
+
+		// If selector is still empty or element is textbox, try Playwright Locator API (more reliable)
+		if sel == "" || foundElement.Role == "textbox" {
+			// Use Playwright Locator API - it handles virtualized elements and iframes better
+			page := s.ctrl.Page()
+			if page != nil {
+				// Try by role first (most reliable)
+				if foundElement.Role != "" {
+					role := playwright.AriaRole(foundElement.Role)
+					var loc playwright.Locator
+					if foundElement.Text != "" {
+						// Use role with name (Name is string, not *string)
+						loc = page.GetByRole(role, playwright.PageGetByRoleOptions{
+							Name:  foundElement.Text,
+							Exact: playwright.Bool(false),
+						})
+					} else {
+						// Use role only
+						loc = page.GetByRole(role)
+					}
+					first := loc.First()
+					if err := first.WaitFor(playwright.LocatorWaitForOptions{
+						State:   playwright.WaitForSelectorStateVisible,
+						Timeout: playwright.Float(10000), // 10s timeout
+					}); err == nil {
+						if err := first.Fill(text); err == nil {
+							return Result{Observation: fmt.Sprintf("filled element [%d] (textbox) with text using Locator API", indexInt)}, nil
+						}
+					}
+				}
+			}
+		}
+
+		if sel == "" {
+			return Result{}, fmt.Errorf("cannot determine selector for element with index %d", indexInt)
+		}
+
+		// Try selector-based fill
+		if err := s.ctrl.Fill(ctx, sel, text); err != nil {
+			// If selector fails and element is textbox, try Playwright Locator API as fallback
+			if foundElement.Role == "textbox" {
+				page := s.ctrl.Page()
+				if page != nil {
+					role := playwright.AriaRole("textbox")
+					var loc playwright.Locator
+					if foundElement.Text != "" {
+						// Name is string, not *string
+						loc = page.GetByRole(role, playwright.PageGetByRoleOptions{
+							Name:  foundElement.Text,
+							Exact: playwright.Bool(false),
+						})
+					} else {
+						loc = page.GetByRole(role)
+					}
+					first := loc.First()
+					if err := first.WaitFor(playwright.LocatorWaitForOptions{
+						State:   playwright.WaitForSelectorStateVisible,
+						Timeout: playwright.Float(10000),
+					}); err == nil {
+						if fillErr := first.Fill(text); fillErr == nil {
+							return Result{Observation: fmt.Sprintf("filled element [%d] (textbox) with text using Locator API fallback", indexInt)}, nil
+						}
+					}
+				}
+			}
+			return Result{}, err
+		}
+		return Result{Observation: fmt.Sprintf("filled element [%d] with text", indexInt)}, nil
 
 	case "fill":
 		sel, err := requiredString(input, "selector")
@@ -526,7 +733,29 @@ func (s *standard) Invoke(ctx context.Context, name string, input map[string]any
 		if err != nil {
 			return Result{}, err
 		}
+		// If answer is "done", "готово", or "yes" (case-insensitive), it's a confirmation (e.g., captcha solved), not data to fill
+		answerLower := strings.ToLower(strings.TrimSpace(answer))
+		if answerLower == "done" || answerLower == "готово" || answerLower == "yes" {
+			return Result{Observation: "User confirmed: action completed (e.g., captcha solved). Continue with the task."}, nil
+		}
+		// Otherwise, return the value directly (like browser-use-reference does) - the LLM will use it in the next action
 		return Result{Observation: answer}, nil
+
+	case "wait":
+		seconds := optionalInt(input, "seconds")
+		if seconds <= 0 {
+			seconds = 3 // Default 3 seconds
+		}
+		if seconds > 30 {
+			seconds = 30 // Cap at 30 seconds
+		}
+		// Reduce by 1 second to account for LLM call time (like browser-use)
+		actualSeconds := seconds - 1
+		if actualSeconds < 0 {
+			actualSeconds = 0
+		}
+		time.Sleep(time.Duration(actualSeconds) * time.Second)
+		return Result{Observation: fmt.Sprintf("waited for %d seconds", seconds)}, nil
 
 	case "save_state":
 		path, err := requiredString(input, "path")
@@ -706,6 +935,10 @@ func sanitizeSelector(sel string) string {
 
 func (s *standard) WaitForStableDOM(ctx context.Context, timeout time.Duration) error {
 	return s.ctrl.WaitForStableDOM(ctx, timeout)
+}
+
+func (s *standard) SetSnapshot(summary *snapshot.Summary) {
+	s.curSnapshot = summary
 }
 
 func (s *standard) Page() playwright.Page {
